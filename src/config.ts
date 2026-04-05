@@ -1,4 +1,4 @@
-import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -262,11 +262,57 @@ export interface SessionTurn {
   winnerId: string;
 }
 
+export interface SessionChamberSnapshot {
+  activeSenatorIds: string[];
+  presidentId?: string;
+}
+
 export interface SessionData {
   id: string;
   createdAt: string;
   updatedAt: string;
   turns: SessionTurn[];
+  chamberSnapshot?: SessionChamberSnapshot;
+}
+
+function isSessionTurn(value: unknown): value is SessionTurn {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof (value as SessionTurn).userPrompt === "string" &&
+      typeof (value as SessionTurn).consensusText === "string" &&
+      typeof (value as SessionTurn).winnerId === "string",
+  );
+}
+
+function isSessionChamberSnapshot(value: unknown): value is SessionChamberSnapshot {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      Array.isArray((value as SessionChamberSnapshot).activeSenatorIds) &&
+      (value as SessionChamberSnapshot).activeSenatorIds.every((id) => typeof id === "string") &&
+      (typeof (value as SessionChamberSnapshot).presidentId === "string" ||
+        typeof (value as SessionChamberSnapshot).presidentId === "undefined"),
+  );
+}
+
+function isSessionData(value: unknown): value is SessionData {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof (value as SessionData).id === "string" &&
+      typeof (value as SessionData).createdAt === "string" &&
+      typeof (value as SessionData).updatedAt === "string" &&
+      Array.isArray((value as SessionData).turns) &&
+      (value as SessionData).turns.every(isSessionTurn) &&
+      (typeof (value as SessionData).chamberSnapshot === "undefined" ||
+        isSessionChamberSnapshot((value as SessionData).chamberSnapshot)),
+  );
+}
+
+function parseSessionData(raw: string): SessionData | null {
+  const parsed = JSON.parse(raw) as unknown;
+  return isSessionData(parsed) ? parsed : null;
 }
 
 function getSessionsDir(): string {
@@ -292,17 +338,26 @@ export async function saveSession(session: SessionData): Promise<void> {
   await ensureSessionsDir();
   const filePath = path.join(getSessionsDir(), `${session.id}.json`);
   session.updatedAt = new Date().toISOString();
-  await writeFile(filePath, `${JSON.stringify(session, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await ensurePermissions(filePath, 0o600);
+  const tempPath = path.join(getSessionsDir(), `.${session.id}.${process.pid}.${randomUUID()}.tmp`);
+
+  try {
+    await writeFile(tempPath, `${JSON.stringify(session, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await ensurePermissions(tempPath, 0o600);
+    await rename(tempPath, filePath);
+    await ensurePermissions(filePath, 0o600);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 export async function loadSession(id: string): Promise<SessionData | null> {
   try {
     const raw = await readFile(path.join(getSessionsDir(), `${id}.json`), "utf8");
-    return JSON.parse(raw) as SessionData;
+    return parseSessionData(raw);
   } catch {
     return null;
   }
@@ -332,8 +387,8 @@ export async function listRecentSessions(limit: number): Promise<SessionSummary[
   for (const file of jsonFiles) {
     try {
       const raw = await readFile(path.join(dir, file), "utf8");
-      const session = JSON.parse(raw) as SessionData;
-      if (session.turns.length > 0) {
+      const session = parseSessionData(raw);
+      if (session && session.turns.length > 0) {
         summaries.push({
           id: session.id,
           createdAt: session.createdAt,

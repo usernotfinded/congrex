@@ -29,6 +29,7 @@ import {
   updateSenator,
   type Provider,
   type SenatorConfig,
+  type SessionChamberSnapshot,
   type SessionData,
   type SessionTurn,
 } from "./config.js";
@@ -42,6 +43,11 @@ import {
   TOO_FEW_ACTIVE_SENATORS_MESSAGE,
 } from "./debateGate.js";
 import { McpManager, MAX_TOOL_CALL_ROUNDS } from "./mcp.js";
+import {
+  chamberSnapshotsDiffer,
+  createSessionChamberSnapshot,
+  deriveSessionRestoreState,
+} from "./sessionResume.js";
 import { initUpdateNotifier, runSelfUpdate } from "./utils/updateNotifier.js";
 import { APP_VERSION } from "./version.js";
 
@@ -3518,7 +3524,7 @@ async function runResumeSession(): Promise<SessionData | null> {
 
   const session = await loadSession(selected);
   if (!session) {
-    console.log(chalk.red("Failed to load session."));
+    console.log(chalk.red("Failed to load session. The file may be missing or invalid."));
     return null;
   }
 
@@ -3581,6 +3587,33 @@ async function ensureMinimumActiveSenators(): Promise<SenatorConfig[]> {
 
 function setLastExecutionContext(turns: SessionTurn[], winnerId: string): void {
   lastExecutionContext = { winnerId, turns: [...turns] };
+}
+
+async function maybeWarnAboutResumedChamberMismatch(session: SessionData): Promise<void> {
+  const currentActiveSenators = getActiveSenators(await loadSenators());
+  const appConfig = await loadAppConfig();
+  const currentSnapshot = createSessionChamberSnapshot(currentActiveSenators, appConfig.presidentId);
+
+  if (chamberSnapshotsDiffer(session.chamberSnapshot, currentSnapshot)) {
+    console.log(
+      chalk.dim(
+        "This session was created under a different chamber. Transcript history was restored, but the next debate will use the current active senators and current Senate President.",
+      ),
+    );
+  }
+}
+
+function restoreSessionDerivedState(session: SessionData): void {
+  const restoredState = deriveSessionRestoreState(session);
+  lastConsensusOutput = restoredState.lastConsensusOutput;
+  lastExecutionContext = null;
+
+  if (restoredState.lastExecutionContext) {
+    setLastExecutionContext(
+      restoredState.lastExecutionContext.turns,
+      restoredState.lastExecutionContext.winnerId,
+    );
+  }
 }
 
 async function runStoredExecutionRound(instruction?: string): Promise<void> {
@@ -3654,9 +3687,8 @@ async function promptForDebateTopic(session: { current: SessionData }): Promise<
       const resumed = await runResumeSession();
       if (resumed) {
         session.current = resumed;
-        lastConsensusOutput = resumed.turns.length > 0 ? resumed.turns[resumed.turns.length - 1].consensusText : "";
-        const lastTurn = resumed.turns[resumed.turns.length - 1];
-        lastExecutionContext = lastTurn ? { winnerId: lastTurn.winnerId, turns: [...resumed.turns] } : null;
+        restoreSessionDerivedState(resumed);
+        await maybeWarnAboutResumedChamberMismatch(resumed);
       }
       continue;
     }
@@ -3804,6 +3836,7 @@ async function runSession(): Promise<void> {
         winnerId: debateResult.winnerId,
       });
       setLastExecutionContext(session.current.turns, debateResult.winnerId);
+      session.current.chamberSnapshot = createSessionChamberSnapshot(activeSenators, appConfig.presidentId);
       await saveSession(session.current);
       if (judgeWinnerRequiresImplementation(debateResult.winner.answer)) {
         await runStoredExecutionRound();
