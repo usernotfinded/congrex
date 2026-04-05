@@ -1,0 +1,55 @@
+{
+  "name": "congrex",
+  "version": "1.0.1",
+  "description": "Congrex AI Senate CLI with a Rust-backed secure execution layer.",
+  "author": "Natan Mucelli",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/natanmucelli/congrex.git"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "congrex": "dist/index.js"
+  },
+  "files": [
+    "dist/**",
+    "scripts/**",
+    "congrex-executor/Cargo.toml",
+    "congrex-executor/Cargo.lock",
+    "congrex-executor/src/**"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
+    "dev": "tsx src/index.ts",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "prepare": "tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "preferGlobal": true,
+  "keywords": [
+    "cli",
+    "ai",
+    "debate",
+    "typescript",
+    "rust",
+    "terminal"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "boxen": "^7.1.1",
+    "chalk": "^4.1.2",
+    "update-notifier": "^7.3.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.3"
+  }
+}

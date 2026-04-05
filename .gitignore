@@ -1,0 +1,11 @@
+# Sensitive local state
+senators.json
+**/senators.json
+
+# Build artifacts and dependencies
+node_modules/
+dist/
+congrex-executor/target/
+
+# Local OS files
+.DS_Store
