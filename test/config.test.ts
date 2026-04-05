@@ -2,15 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { resolveSenatorApiKey } from "../src/apiKeys.js";
 import {
   createEmptySession,
   getConfigDir,
   getSenatorsFilePath,
   listRecentSessions,
+  loadAppConfig,
   loadSenators,
   loadSession,
+  saveAppConfig,
   saveSession,
   saveSenators,
   type SenatorConfig,
@@ -44,6 +46,15 @@ function createSenator(overrides: Partial<SenatorConfig> = {}): SenatorConfig {
   };
 }
 
+async function listConfigTempFiles(): Promise<string[]> {
+  try {
+    const entries = await readdir(getConfigDir());
+    return entries.filter((entry) => entry.endsWith(".tmp"));
+  } catch {
+    return [];
+  }
+}
+
 test("save/load preserves apiKeyEnvVar and never writes the resolved secret value", { concurrency: false }, async () => {
   await withTempConfigDir(async () => {
     const secretValue = "sk-live-secret-value";
@@ -62,6 +73,7 @@ test("save/load preserves apiKeyEnvVar and never writes the resolved secret valu
       const loaded = await loadSenators();
       assert.equal(loaded.length, 1);
       assert.equal(loaded[0]?.apiKeyEnvVar, "CONGREX_TEST_OPENAI_KEY");
+      assert.deepEqual(await listConfigTempFiles(), []);
     } finally {
       delete process.env.CONGREX_TEST_OPENAI_KEY;
     }
@@ -129,6 +141,77 @@ test("apiKeyEnvVar takes precedence over apiKey, with deterministic fallback to 
     ),
     "provider-api-key",
   );
+});
+
+test("custom OpenAI-compatible providers resolve apiKeyEnvVar before apiKey", { concurrency: false }, () => {
+  const customSenator = createSenator({
+    provider: "custom",
+    apiKey: "stored-custom-key",
+    apiKeyEnvVar: "CONGREX_CUSTOM_COMPAT_KEY",
+  });
+
+  assert.equal(
+    resolveSenatorApiKey(customSenator, {
+      CONGREX_CUSTOM_COMPAT_KEY: "env-custom-key",
+    }),
+    "env-custom-key",
+  );
+
+  assert.equal(
+    resolveSenatorApiKey(customSenator, {}),
+    "stored-custom-key",
+  );
+});
+
+test("local OpenAI-compatible providers resolve optional keys through the shared resolver", { concurrency: false }, () => {
+  const localSenator = createSenator({
+    provider: "local",
+    apiKey: "stored-local-key",
+    apiKeyEnvVar: "CONGREX_LOCAL_COMPAT_KEY",
+  });
+
+  assert.equal(
+    resolveSenatorApiKey(localSenator, {
+      CONGREX_LOCAL_COMPAT_KEY: "env-local-key",
+    }),
+    "env-local-key",
+  );
+
+  assert.equal(
+    resolveSenatorApiKey(localSenator, {}),
+    "stored-local-key",
+  );
+});
+
+test("save/load preserves app config without leaving temp files behind", { concurrency: false }, async () => {
+  await withTempConfigDir(async () => {
+    await saveAppConfig({
+      presidentId: "senator-2",
+      presets: {
+        core: ["senator-1", "senator-2"],
+      },
+      mcpServers: {
+        filesystem: {
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-filesystem"],
+        },
+      },
+    });
+
+    assert.deepEqual(await loadAppConfig(), {
+      presidentId: "senator-2",
+      presets: {
+        core: ["senator-1", "senator-2"],
+      },
+      mcpServers: {
+        filesystem: {
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-filesystem"],
+        },
+      },
+    });
+    assert.deepEqual(await listConfigTempFiles(), []);
+  });
 });
 
 test("invalid but parseable session files are rejected and skipped", { concurrency: false }, async () => {

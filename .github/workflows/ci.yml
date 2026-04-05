@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify-windows:
+    name: Verify on windows-latest
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build Rust executor
+        working-directory: congrex-executor
+        run: cargo build
+
+      - name: Test Rust executor
+        working-directory: congrex-executor
+        run: cargo test
+
+      - name: Run Node tests
+        run: npm test
+
+      - name: Build project
+        run: npm run build

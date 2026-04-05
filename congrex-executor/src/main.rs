@@ -222,12 +222,26 @@ async fn execute_command(
         command.pre_exec(|| set_process_group());
     }
 
+    #[cfg(not(windows))]
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn {:?}", params.command))
         .map_err(RpcError::exec_failed)?;
 
+    #[cfg(windows)]
+    let WindowsContainedChild {
+        mut child,
+        job_guard,
+    } = spawn_windows_contained_child(&mut command, &params.command)
+        .map_err(RpcError::exec_failed)?;
+
+    #[cfg(not(windows))]
     let output = capture_child(&mut child, Duration::from_millis(timeout_ms))
+        .await
+        .map_err(|err| RpcError::exec_failed(err.into()))?;
+
+    #[cfg(windows)]
+    let output = capture_child(&mut child, Duration::from_millis(timeout_ms), job_guard)
         .await
         .map_err(|err| RpcError::exec_failed(err.into()))?;
 
@@ -242,6 +256,7 @@ async fn execute_command(
     }))
 }
 
+#[cfg(not(windows))]
 async fn capture_child(child: &mut Child, timeout: Duration) -> io::Result<CommandResult> {
     let stdout = child
         .stdout
@@ -265,6 +280,53 @@ async fn capture_child(child: &mut Child, timeout: Duration) -> io::Result<Comma
         }
         _ = &mut deadline => {
             kill_process_tree(child);
+            (EXEC_TIMEOUT_EXIT_CODE, true)
+        }
+    };
+
+    let stdout = join_capture(&mut stdout_task).await?;
+    let stderr = join_capture(&mut stderr_task).await?;
+
+    Ok(CommandResult {
+        exit_code,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+#[cfg(windows)]
+async fn capture_child(
+    child: &mut Child,
+    timeout: Duration,
+    job_guard: job_object::JobObjectGuard,
+) -> io::Result<CommandResult> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("stderr pipe unavailable"))?;
+
+    let mut stdout_task = tokio::spawn(read_capped(BufReader::new(stdout), MAX_OUTPUT_BYTES));
+    let mut stderr_task = tokio::spawn(read_capped(BufReader::new(stderr), MAX_OUTPUT_BYTES));
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut job_guard = Some(job_guard);
+
+    let (exit_code, timed_out) = tokio::select! {
+        status = child.wait() => {
+            let status = status?;
+            (status.code().unwrap_or(-1), false)
+        }
+        _ = &mut deadline => {
+            // Closing the Job Object kills the contained child and every
+            // descendant process. Windows timeout cleanup must rely on this
+            // containment boundary, not on direct-child termination.
+            drop(job_guard.take());
             (EXEC_TIMEOUT_EXIT_CODE, true)
         }
     };
@@ -414,6 +476,53 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+#[cfg(windows)]
+struct WindowsContainedChild {
+    child: Child,
+    job_guard: job_object::JobObjectGuard,
+}
+
+#[cfg(windows)]
+fn spawn_windows_contained_child(
+    command: &mut Command,
+    command_for_error: &[String],
+) -> Result<WindowsContainedChild> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    // Spawn suspended so the child cannot execute any user-approved command
+    // logic until it is successfully bound to the Job Object.
+    command.creation_flags(CREATE_SUSPENDED);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {:?}", command_for_error))?;
+    let process_handle = child
+        .raw_handle()
+        .ok_or_else(|| anyhow!("spawned Windows child is missing a process handle"))?
+        as HANDLE;
+
+    let job_guard = match job_object::JobObjectGuard::new_for_process(process_handle) {
+        Ok(guard) => guard,
+        Err(err) => {
+            let _ = child.start_kill();
+            return Err(anyhow!(
+                "failed to establish Windows timeout containment before process start: {err}"
+            ));
+        }
+    };
+
+    if let Err(err) = job_object::resume_process(process_handle) {
+        drop(job_guard);
+        let _ = child.start_kill();
+        return Err(anyhow!(
+            "failed to resume Windows child after Job Object assignment: {err}"
+        ));
+    }
+
+    Ok(WindowsContainedChild { child, job_guard })
+}
+
 /// [P2 FIX] Comprehensive command denylist — defense-in-depth alongside the
 /// TypeScript-side validation. Both layers must pass before a command runs.
 ///
@@ -437,20 +546,46 @@ fn blocked_command_reason(command: &[String]) -> Option<String> {
     // ── Category 1-2: Privilege escalation + shells ──
     if matches!(
         program.as_str(),
-        "sudo" | "su" | "doas" | "pkexec" | "runas"
-            | "bash" | "sh" | "zsh" | "fish" | "csh" | "tcsh" | "ksh" | "dash"
-            | "cmd" | "powershell" | "pwsh"
+        "sudo"
+            | "su"
+            | "doas"
+            | "pkexec"
+            | "runas"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "csh"
+            | "tcsh"
+            | "ksh"
+            | "dash"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
     ) {
-        return Some(format!("program '{program}' is blocked (shell or privilege escalation)"));
+        return Some(format!(
+            "program '{program}' is blocked (shell or privilege escalation)"
+        ));
     }
 
     // ── Category 1b: Execution wrappers that bypass denylists ──
     if matches!(
         program.as_str(),
-        "nohup" | "env" | "xargs" | "nice" | "ionice" | "timeout" | "stdbuf"
-            | "setsid" | "start" | "open" | "xdg-open"
+        "nohup"
+            | "env"
+            | "xargs"
+            | "nice"
+            | "ionice"
+            | "timeout"
+            | "stdbuf"
+            | "setsid"
+            | "start"
+            | "open"
+            | "xdg-open"
     ) {
-        return Some(format!("program '{program}' is blocked (execution wrapper / launcher)"));
+        return Some(format!(
+            "program '{program}' is blocked (execution wrapper / launcher)"
+        ));
     }
 
     // ── Category 1c: Background / scheduling / multiplexing ──
@@ -458,27 +593,52 @@ fn blocked_command_reason(command: &[String]) -> Option<String> {
         program.as_str(),
         "screen" | "tmux" | "at" | "batch" | "crontab" | "nq"
     ) {
-        return Some(format!("program '{program}' is blocked (background/scheduling)"));
+        return Some(format!(
+            "program '{program}' is blocked (background/scheduling)"
+        ));
     }
 
     // ── Category 3: Remote access / data exfiltration ──
     if matches!(
         program.as_str(),
-        "ssh" | "scp" | "sftp" | "rsync" | "telnet" | "ftp"
-            | "nc" | "ncat" | "netcat" | "socat"
-            | "curl" | "wget" | "httpie"
+        "ssh"
+            | "scp"
+            | "sftp"
+            | "rsync"
+            | "telnet"
+            | "ftp"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "socat"
+            | "curl"
+            | "wget"
+            | "httpie"
     ) {
-        return Some(format!("program '{program}' is blocked (network/remote access)"));
+        return Some(format!(
+            "program '{program}' is blocked (network/remote access)"
+        ));
     }
 
     // ── Category 4: System management / disk ──
     if matches!(
         program.as_str(),
-        "dd" | "mkfs" | "fdisk" | "parted" | "diskutil" | "format"
-            | "systemctl" | "service" | "launchctl"
-            | "shutdown" | "reboot" | "halt" | "init"
+        "dd" | "mkfs"
+            | "fdisk"
+            | "parted"
+            | "diskutil"
+            | "format"
+            | "systemctl"
+            | "service"
+            | "launchctl"
+            | "shutdown"
+            | "reboot"
+            | "halt"
+            | "init"
     ) {
-        return Some(format!("program '{program}' is blocked (system/disk management)"));
+        return Some(format!(
+            "program '{program}' is blocked (system/disk management)"
+        ));
     }
 
     // ── Category 5: Container / VM ──
@@ -497,28 +657,53 @@ fn blocked_command_reason(command: &[String]) -> Option<String> {
     // ── Category 7: Package managers ──
     if matches!(
         program.as_str(),
-        "apt" | "apt-get" | "yum" | "dnf" | "pacman" | "brew"
-            | "pip" | "pip3" | "gem" | "cargo" | "go"
+        "apt"
+            | "apt-get"
+            | "yum"
+            | "dnf"
+            | "pacman"
+            | "brew"
+            | "pip"
+            | "pip3"
+            | "gem"
+            | "cargo"
+            | "go"
     ) {
         return Some(format!("program '{program}' is blocked (package manager)"));
     }
 
     // ── Category 8: Credential access ──
-    if matches!(
-        program.as_str(),
-        "security" | "keychain" | "pass" | "gpg"
-    ) {
-        return Some(format!("program '{program}' is blocked (credential access)"));
+    if matches!(program.as_str(), "security" | "keychain" | "pass" | "gpg") {
+        return Some(format!(
+            "program '{program}' is blocked (credential access)"
+        ));
     }
 
     // ── Category 9: Interpreter inline eval ──
     if matches!(
         program.as_str(),
-        "python" | "python3" | "node" | "deno" | "ruby" | "perl" | "php" | "lua"
-            | "gcc" | "g++" | "clang" | "clang++" | "cc" | "c++"
+        "python"
+            | "python3"
+            | "node"
+            | "deno"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "lua"
+            | "gcc"
+            | "g++"
+            | "clang"
+            | "clang++"
+            | "cc"
+            | "c++"
     ) {
-        if matches!(program.as_str(), "gcc" | "g++" | "clang" | "clang++" | "cc" | "c++") {
-            return Some(format!("program '{program}' is blocked (compiler as code execution vector)"));
+        if matches!(
+            program.as_str(),
+            "gcc" | "g++" | "clang" | "clang++" | "cc" | "c++"
+        ) {
+            return Some(format!(
+                "program '{program}' is blocked (compiler as code execution vector)"
+            ));
         }
         if args
             .iter()
@@ -543,7 +728,9 @@ fn blocked_command_reason(command: &[String]) -> Option<String> {
         return Some("find with mutation actions (-delete, -exec) is blocked".to_string());
     }
     if program == "chmod" || program == "chown" || program == "chgrp" {
-        return Some(format!("program '{program}' is blocked (permission changes)"));
+        return Some(format!(
+            "program '{program}' is blocked (permission changes)"
+        ));
     }
 
     // ── Category 11: Destructive git operations ──
@@ -552,10 +739,21 @@ fn blocked_command_reason(command: &[String]) -> Option<String> {
             let sub = subcmd.to_ascii_lowercase();
             if matches!(
                 sub.as_str(),
-                "push" | "clean" | "reset" | "rebase" | "merge" | "cherry-pick"
-                    | "rm" | "mv" | "remote" | "config" | "filter-branch"
+                "push"
+                    | "clean"
+                    | "reset"
+                    | "rebase"
+                    | "merge"
+                    | "cherry-pick"
+                    | "rm"
+                    | "mv"
+                    | "remote"
+                    | "config"
+                    | "filter-branch"
             ) {
-                return Some(format!("'git {sub}' is blocked (destructive git operation)"));
+                return Some(format!(
+                    "'git {sub}' is blocked (destructive git operation)"
+                ));
             }
         }
     }
@@ -796,11 +994,6 @@ fn set_process_group() -> io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
-fn set_process_group() -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(unix)]
 fn kill_process_tree(child: &mut Child) {
     unsafe extern "C" {
@@ -817,7 +1010,350 @@ fn kill_process_tree(child: &mut Child) {
     let _ = child.start_kill();
 }
 
+// ---------------------------------------------------------------------------
+// Windows Job Object — ensures the entire process tree is terminated when the
+// Job Object handle is closed (on timeout, on drop, or on normal exit).
+// ---------------------------------------------------------------------------
 #[cfg(windows)]
-fn kill_process_tree(child: &mut Child) {
-    let _ = child.start_kill();
+mod job_object {
+    use std::io;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtResumeProcess(process_handle: HANDLE) -> i32;
+    }
+
+    /// RAII wrapper around a Windows Job Object handle.
+    ///
+    /// When this struct is dropped the handle is closed. Because the Job Object
+    /// was created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, closing the last
+    /// handle terminates every process still associated with the job — i.e. the
+    /// entire process tree spawned by the child.
+    pub struct JobObjectGuard {
+        handle: HANDLE,
+    }
+
+    // SAFETY: The HANDLE is an opaque kernel object pointer that is safe to
+    // send across threads.
+    unsafe impl Send for JobObjectGuard {}
+
+    impl Drop for JobObjectGuard {
+        fn drop(&mut self) {
+            if self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null() {
+                unsafe {
+                    CloseHandle(self.handle);
+                }
+            }
+        }
+    }
+
+    impl JobObjectGuard {
+        /// Create a new anonymous Job Object configured with
+        /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assign a suspended process
+        /// to it before the process is resumed.
+        pub fn new_for_process(process_handle: HANDLE) -> io::Result<Self> {
+            unsafe {
+                // 1. Create an anonymous job object.
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // 2. Configure KILL_ON_JOB_CLOSE so that when the last handle
+                //    to this job is closed, all associated processes are killed.
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation = JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                    LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    ..std::mem::zeroed()
+                };
+                let ok = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if ok == 0 {
+                    let err = io::Error::last_os_error();
+                    CloseHandle(job);
+                    return Err(err);
+                }
+
+                // 3. Assign the suspended process to the job before it runs.
+                let ok = AssignProcessToJobObject(job, process_handle);
+                if ok == 0 {
+                    let err = io::Error::last_os_error();
+                    CloseHandle(job);
+                    return Err(err);
+                }
+
+                Ok(Self { handle: job })
+            }
+        }
+    }
+
+    pub fn resume_process(process_handle: HANDLE) -> io::Result<()> {
+        unsafe {
+            let status = NtResumeProcess(process_handle);
+            if status >= 0 {
+                return Ok(());
+            }
+
+            Err(io::Error::other(format!(
+                "NtResumeProcess failed with NTSTATUS {status:#010x}"
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::{self, BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+        };
+
+        /// This test only compiles on Windows, but it validates that the module
+        /// structure and type references are correct.
+        #[test]
+        fn guard_is_constructable_type() {
+            // We cannot call new_for_process without a real process handle, but
+            // we can verify the type exists and is Send (required for async).
+            fn _assert_send<T: Send>() {}
+            _assert_send::<super::JobObjectGuard>();
+        }
+
+        fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+            unsafe {
+                let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle == 0 {
+                    return true;
+                }
+
+                let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+                let status = WaitForSingleObject(handle, wait_ms);
+                CloseHandle(handle);
+                status == WAIT_OBJECT_0
+            }
+        }
+
+        fn pid_is_running(pid: u32) -> bool {
+            unsafe {
+                let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle == 0 {
+                    return false;
+                }
+
+                let status = WaitForSingleObject(handle, 0);
+                CloseHandle(handle);
+                status == WAIT_TIMEOUT
+            }
+        }
+
+        fn wait_for_child_exit(
+            child: &mut std::process::Child,
+            timeout: Duration,
+        ) -> io::Result<bool> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if child.try_wait()?.is_some() {
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        #[test]
+        fn dropping_job_object_guard_terminates_immediate_descendants() {
+            let script = concat!(
+                "$ErrorActionPreference='Stop'; ",
+                "$child = Start-Process ping.exe -ArgumentList '127.0.0.1 -n 30' -PassThru; ",
+                "Write-Output $child.Id; ",
+                "Start-Sleep -Seconds 30"
+            );
+
+            let mut child = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to spawn powershell test harness");
+
+            let guard = super::JobObjectGuard::new_for_process(
+                std::os::windows::io::AsRawHandle::as_raw_handle(&child)
+                    as windows_sys::Win32::Foundation::HANDLE,
+            )
+            .expect("failed to assign child to Job Object");
+
+            let stdout = child.stdout.take().expect("stdout pipe unavailable");
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .expect("failed to read descendant pid");
+
+            let descendant_pid = line
+                .trim()
+                .parse::<u32>()
+                .expect("powershell did not emit a descendant pid");
+
+            assert!(
+                pid_is_running(descendant_pid),
+                "descendant should still be running before the Job Object is dropped"
+            );
+
+            drop(guard);
+
+            assert!(
+                wait_for_pid_exit(descendant_pid, Duration::from_secs(5)),
+                "descendant process should exit after Job Object close"
+            );
+            assert!(
+                wait_for_child_exit(&mut child, Duration::from_secs(5))
+                    .expect("failed to poll outer child"),
+                "outer child should exit after Job Object close"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_unique_match_works() {
+        let (start, end) = find_unique_match("hello world", "world").unwrap();
+        assert_eq!(start, 6);
+        assert_eq!(end, 11);
+    }
+
+    #[test]
+    fn find_unique_match_rejects_duplicate() {
+        let err = find_unique_match("abcabc", "abc").unwrap_err();
+        assert!(err.to_string().contains("not unique"));
+    }
+
+    #[test]
+    fn find_unique_match_rejects_missing() {
+        let err = find_unique_match("hello", "xyz").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn sanitize_output_strips_ansi() {
+        let input = b"\x1b[31mred\x1b[0m plain";
+        let result = sanitize_output(input);
+        assert_eq!(result, "red plain");
+    }
+
+    #[test]
+    fn program_name_strips_exe_suffix() {
+        assert_eq!(program_name("cmd.exe"), "cmd");
+        assert_eq!(program_name("git"), "git");
+        // Forward-slash paths work on all platforms.
+        assert_eq!(program_name("/usr/bin/git"), "git");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn program_name_windows_backslash_path() {
+        assert_eq!(program_name("C:\\Windows\\System32\\cmd.exe"), "cmd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_tree_is_unix_variant() {
+        // Compile-time check: on Unix the kill_process_tree function
+        // references getpgid/killpg. This test ensures it compiles.
+        let _fn_ptr: fn(&mut Child) = kill_process_tree;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_timeout_closes_job_and_kills_immediate_descendants() {
+        use std::process::Stdio;
+        use tokio::time::timeout;
+
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+        };
+
+        fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+            unsafe {
+                let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle == 0 {
+                    return true;
+                }
+
+                let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+                let status = WaitForSingleObject(handle, wait_ms);
+                CloseHandle(handle);
+                status == WAIT_OBJECT_0
+            }
+        }
+
+        let script = concat!(
+            "$ErrorActionPreference='Stop'; ",
+            "$child = Start-Process ping.exe -ArgumentList '127.0.0.1 -n 30' -PassThru; ",
+            "Write-Output $child.Id; ",
+            "[Console]::Out.Flush(); ",
+            "Start-Sleep -Seconds 30"
+        );
+
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .env("TERM", "dumb")
+            .env("NO_COLOR", "1");
+
+        let WindowsContainedChild {
+            mut child,
+            job_guard,
+        } = spawn_windows_contained_child(&mut command, &["powershell.exe".to_string()]).unwrap();
+
+        let output = capture_child(&mut child, Duration::from_millis(1000), job_guard)
+            .await
+            .unwrap();
+        assert!(output.timed_out);
+        assert_eq!(output.exit_code, EXEC_TIMEOUT_EXIT_CODE);
+
+        let stdout = String::from_utf8_lossy(&output.stdout.bytes);
+        let descendant_pid = stdout
+            .lines()
+            .next()
+            .expect("expected descendant pid from test script")
+            .trim()
+            .parse::<u32>()
+            .expect("failed to parse descendant pid");
+
+        assert!(
+            wait_for_pid_exit(descendant_pid, Duration::from_secs(5)),
+            "descendant process should exit after timeout closes the Job Object"
+        );
+
+        timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("timed out waiting for outer child to exit")
+            .expect("failed to wait for outer child");
+    }
 }

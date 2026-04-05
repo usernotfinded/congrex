@@ -61,6 +61,7 @@ const STORE_VERSION = 1;
 const APP_NAME = "congrex";
 const SUPPORTED_PROVIDERS = new Set<Provider>(["openai", "anthropic", "google", "xai", "custom", "local"]);
 const ENV_VAR_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SECURE_FILE_MODE = 0o600;
 
 function normalizeOptionalEnvVarName(value: unknown): string | undefined {
   if (typeof value !== "string") {
@@ -124,6 +125,27 @@ async function ensureConfigDir(): Promise<void> {
   await ensurePermissions(configDir, 0o700);
 }
 
+async function atomicWriteJsonFile(filePath: string, payload: unknown): Promise<void> {
+  const dir = path.dirname(filePath);
+  const tempPath = path.join(
+    dir,
+    `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+
+  try {
+    await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: SECURE_FILE_MODE,
+    });
+    await ensurePermissions(tempPath, SECURE_FILE_MODE);
+    await rename(tempPath, filePath);
+    await ensurePermissions(filePath, SECURE_FILE_MODE);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 export async function loadSenators(): Promise<SenatorConfig[]> {
   const filePath = getSenatorsFilePath();
 
@@ -168,11 +190,7 @@ export async function saveSenators(senators: SenatorConfig[]): Promise<void> {
     senators: senators.map(normalizeSenatorForPersistence),
   };
 
-  await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await ensurePermissions(filePath, 0o600);
+  await atomicWriteJsonFile(filePath, payload);
 }
 
 export async function clearSenators(): Promise<void> {
@@ -338,20 +356,7 @@ export async function saveSession(session: SessionData): Promise<void> {
   await ensureSessionsDir();
   const filePath = path.join(getSessionsDir(), `${session.id}.json`);
   session.updatedAt = new Date().toISOString();
-  const tempPath = path.join(getSessionsDir(), `.${session.id}.${process.pid}.${randomUUID()}.tmp`);
-
-  try {
-    await writeFile(tempPath, `${JSON.stringify(session, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await ensurePermissions(tempPath, 0o600);
-    await rename(tempPath, filePath);
-    await ensurePermissions(filePath, 0o600);
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {});
-    throw error;
-  }
+  await atomicWriteJsonFile(filePath, session);
 }
 
 export async function loadSession(id: string): Promise<SessionData | null> {
@@ -437,9 +442,5 @@ export async function loadAppConfig(): Promise<AppConfig> {
 export async function saveAppConfig(config: AppConfig): Promise<void> {
   await ensureConfigDir();
   const filePath = getAppConfigPath();
-  await writeFile(filePath, `${JSON.stringify(config, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await ensurePermissions(filePath, 0o600);
+  await atomicWriteJsonFile(filePath, config);
 }

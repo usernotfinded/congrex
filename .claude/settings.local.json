@@ -17,7 +17,12 @@
       "Read(//usr/local/**)",
       "Read(//Users/natanmucelli/Desktop/prog/congrex/**)",
       "Bash(source \"$HOME/.cargo/env\")",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(source ~/.nvm/nvm.sh)",
+      "Bash(npm run:*)",
+      "Bash(npm test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)"
     ]
   }
 }

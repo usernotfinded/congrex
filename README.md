@@ -1,4 +1,4 @@
-# Congrex AI Senate (v1.0.2)
+# Congrex AI Senate (v1.0.3)
 
 Congrex turns one prompt into a structured debate between multiple AI models, then promotes the strongest answer into an optional supervised execution round when implementation is actually needed.
 

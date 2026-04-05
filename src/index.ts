@@ -36,13 +36,19 @@ import {
 import { providerEnvVarNames, resolveSenatorApiKey } from "./apiKeys.js";
 import { CongrexExecutor, CongrexExecutorError } from "./congrexExecutor.js";
 import {
+  canUseMcpToolsForDebate,
+  canUseMcpToolsForProviderTurn,
   DEBATE_MIN_ACTIVE_SENATORS,
   getDebateStartBlockReason,
   hasDesignatedPresident,
+  MCP_DISABLED_HOSTED_PROVIDER_MESSAGE,
+  MCP_TOOL_USE_REJECTED_MESSAGE,
   MISSING_SENATE_PRESIDENT_MESSAGE,
   TOO_FEW_ACTIVE_SENATORS_MESSAGE,
 } from "./debateGate.js";
-import { McpManager, MAX_TOOL_CALL_ROUNDS } from "./mcp.js";
+import { readResponseTextCapped, ResponseBodyTooLargeError } from "./http.js";
+import { McpManager, MAX_TOOL_CALL_ROUNDS, getMcpToolFingerprint } from "./mcp.js";
+import { sanitizeForDisplay } from "./sanitize.js";
 import {
   chamberSnapshotsDiffer,
   createSessionChamberSnapshot,
@@ -320,8 +326,10 @@ const congrexExecutor = new CongrexExecutor();
 // ── MCP session approval cache (in-memory only, never persisted to disk) ──
 // Survives shutdown+reinitialize cycles within the same process so the user
 // approves tools once per session and is only re-prompted when new tools appear.
+// Approvals are keyed by fingerprint (SHA-256 over server+name+description+schema)
+// so that any change in tool identity forces re-approval.
 let mcpApprovalMode: "all" | "selected" | "disabled" | null = null;
-let mcpApprovedToolNames = new Set<string>();
+let mcpApprovedFingerprints = new Set<string>();
 
 const EXECUTION_SYSTEM_PROMPT =
   "You are the elected Executive within the Congrex Consensus Engine. The Senate has debated and reached a consensus. Implement the changes using the two available tools: edit_file for precise, surgical file modifications, and execute_command for tests, builds, git inspection, and safe terminal reads. edit_file takes {file_path, search, replace}. execute_command takes {command: [program, ...args], cwd?, timeout_ms?}. execute_command does NOT use a shell string, so never pass pipes, redirects, &&, or quoted shell snippets. Always verify your edits by running the relevant command after each change. Do not make unnecessary changes. When all changes are complete and verified, provide a brief summary.";
@@ -1714,7 +1722,30 @@ async function armoredJsonRequest<T>(params: {
         signal,
       });
 
-      const rawText = await response.text();
+      let rawText = "";
+      try {
+        rawText = await readResponseTextCapped(response);
+      } catch (error) {
+        if (error instanceof ResponseBodyTooLargeError) {
+          return {
+            ok: false,
+            failure: buildArmoredFailure({
+              kind: "response",
+              senator: params.senator,
+              stage: params.stage,
+              url: params.url,
+              method,
+              attempts: attempt,
+              retryable: false,
+              message: error.message,
+              status: response.status,
+              statusText: response.statusText,
+            }),
+          };
+        }
+
+        throw error;
+      }
       let data: Record<string, unknown> = {};
 
       if (rawText.trim()) {
@@ -1872,8 +1903,6 @@ async function generateWithSenator(
   signal: AbortSignal,
   enableTools = false,
 ): Promise<SenatorGenerationResult> {
-  const useTools = enableTools && mcpManager.hasTools;
-
   switch (senator.provider) {
     case "openai":
     case "xai":
@@ -1902,7 +1931,12 @@ async function generateWithSenator(
       const baseUrl = trimTrailingSlash(resolvedBaseUrl || "https://api.openai.com/v1");
       const auth =
         senator.provider === "custom" || senator.provider === "local"
-          ? { ok: true as const, apiKey: senator.apiKey?.trim() || "" }
+          ? {
+              ok: true as const,
+              // OpenAI-compatible providers may allow anonymous access, so we
+              // resolve the shared credential chain but do not require a key.
+              apiKey: resolveSenatorApiKey(senator) || "",
+            }
           : requireApiKey(senator, stage, `${baseUrl}/chat/completions`);
       if (!auth.ok) {
         return auth;
@@ -1915,12 +1949,18 @@ async function generateWithSenator(
       ];
 
       for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
+        const useToolsThisTurn = canUseMcpToolsForProviderTurn(
+          enableTools,
+          mcpManager.hasTools,
+          round,
+          MAX_TOOL_CALL_ROUNDS,
+        );
         const body: Record<string, unknown> = {
           model: senator.modelId,
           messages,
           temperature: 0.7,
         };
-        if (useTools && round < MAX_TOOL_CALL_ROUNDS) {
+        if (useToolsThisTurn) {
           body.tools = mcpManager.toOpenAiTools();
         }
 
@@ -1942,6 +1982,24 @@ async function generateWithSenator(
 
         const choice = request.data.choices?.[0];
         const toolCalls = choice?.message?.tool_calls;
+
+        if (toolCalls && toolCalls.length > 0 && !useToolsThisTurn) {
+          return {
+            ok: false,
+            failure: buildArmoredFailure({
+              kind: "response",
+              senator,
+              stage,
+              url: `${baseUrl}/chat/completions`,
+              method: "POST",
+              attempts: request.attempts,
+              retryable: false,
+              message: MCP_TOOL_USE_REJECTED_MESSAGE,
+              status: request.status,
+              rawText: request.rawText,
+            }),
+          };
+        }
 
         if (!toolCalls || toolCalls.length === 0 || choice?.finish_reason !== "tool_calls") {
           try {
@@ -1982,13 +2040,19 @@ async function generateWithSenator(
       ];
 
       for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
+        const useToolsThisTurn = canUseMcpToolsForProviderTurn(
+          enableTools,
+          mcpManager.hasTools,
+          round,
+          MAX_TOOL_CALL_ROUNDS,
+        );
         const body: Record<string, unknown> = {
           model: senator.modelId,
           max_tokens: ANTHROPIC_MAX_TOKENS,
           system: prompt.system,
           messages,
         };
-        if (useTools && round < MAX_TOOL_CALL_ROUNDS) {
+        if (useToolsThisTurn) {
           body.tools = mcpManager.toAnthropicTools();
         }
 
@@ -2009,6 +2073,24 @@ async function generateWithSenator(
         }
 
         const toolUseBlocks = (request.data.content || []).filter((b) => b.type === "tool_use");
+
+        if (toolUseBlocks.length > 0 && !useToolsThisTurn) {
+          return {
+            ok: false,
+            failure: buildArmoredFailure({
+              kind: "response",
+              senator,
+              stage,
+              url,
+              method: "POST",
+              attempts: request.attempts,
+              retryable: false,
+              message: MCP_TOOL_USE_REJECTED_MESSAGE,
+              status: request.status,
+              rawText: request.rawText,
+            }),
+          };
+        }
 
         if (toolUseBlocks.length === 0 || request.data.stop_reason !== "tool_use") {
           try {
@@ -2052,12 +2134,18 @@ async function generateWithSenator(
       ];
 
       for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
+        const useToolsThisTurn = canUseMcpToolsForProviderTurn(
+          enableTools,
+          mcpManager.hasTools,
+          round,
+          MAX_TOOL_CALL_ROUNDS,
+        );
         const body: Record<string, unknown> = {
           systemInstruction: { parts: [{ text: prompt.system }] },
           contents,
           generationConfig: { temperature: 0.7 },
         };
-        if (useTools && round < MAX_TOOL_CALL_ROUNDS) {
+        if (useToolsThisTurn) {
           body.tools = mcpManager.toGoogleTools();
         }
 
@@ -2079,6 +2167,24 @@ async function generateWithSenator(
 
         const parts = request.data.candidates?.[0]?.content?.parts || [];
         const functionCalls = parts.filter((p): p is GooglePart & { functionCall: GoogleFunctionCall } => Boolean(p.functionCall));
+
+        if (functionCalls.length > 0 && !useToolsThisTurn) {
+          return {
+            ok: false,
+            failure: buildArmoredFailure({
+              kind: "response",
+              senator,
+              stage,
+              url,
+              method: "POST",
+              attempts: request.attempts,
+              retryable: false,
+              message: MCP_TOOL_USE_REJECTED_MESSAGE,
+              status: request.status,
+              rawText: request.rawText,
+            }),
+          };
+        }
 
         if (functionCalls.length === 0) {
           try {
@@ -2146,10 +2252,11 @@ async function runAnswerRound(
   failures: string[],
   signal: AbortSignal,
   history: ChatMessage[],
+  enableMcpTools = true,
 ): Promise<AnswerRecord[]> {
   const results = await Promise.all(
     senators.map(async (senator) => {
-      const result = await generateWithSenator(senator, buildAnswerPrompt(userPrompt, history, senator), "round 1", signal, true);
+      const result = await generateWithSenator(senator, buildAnswerPrompt(userPrompt, history, senator), "round 1", signal, enableMcpTools);
       if (!result.ok) {
         failures.push(formatArmoredFailure(result.failure));
         return null;
@@ -2436,8 +2543,16 @@ async function debate(userPrompt: string, senators: SenatorConfig[], signal: Abo
   const spinner = createEngineSpinner(`${DEBATE_SPINNER_ACTIVE_TEXT}${DEBATE_SPINNER_STATIC_TEXT}`);
   const appConfig = await loadAppConfig();
 
+  // [SECURITY] Disable MCP tools when any senator uses a hosted provider.
+  // Hosted providers must never receive MCP tool definitions or results
+  // because read-only tools could become data-exfiltration primitives.
+  const mcpSafeForDebate = canUseMcpToolsForDebate(senators);
+  if (!mcpSafeForDebate && mcpManager.hasTools) {
+    console.error(chalk.yellow(MCP_DISABLED_HOSTED_PROVIDER_MESSAGE));
+  }
+
   try {
-    const answers = await runAnswerRound(userPrompt, senators, failures, signal, history);
+    const answers = await runAnswerRound(userPrompt, senators, failures, signal, history, mcpSafeForDebate);
     if (answers.length === 0) {
       spinner.stop();
       for (const failure of failures) {
@@ -2479,17 +2594,7 @@ function renderFinal(result: DebateResult): void {
 
 // ─── Execution Round — HITL supervised file editing ─────────────────
 
-function sanitizeForDisplay(str: string): string {
-  return str
-    // Strip ANSI escape sequences: CSI (ESC[...), OSC (ESC]...BEL), and single-char escapes
-    .replace(/\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07]*(?:\x07|\x1b\\)|[()][AB012]|[>=<]|[78HMDE])/g, "")
-    // Strip Unicode BiDi control characters (can visually reverse or override text direction)
-    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
-    // Strip C0 control characters (except \t and \n) and DEL
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-    // Strip C1 control character range (U+0080–U+009F) — includes 8-bit CSI, OSC, DCS, ST
-    .replace(/[\u0080-\u009F]/g, "");
-}
+// sanitizeForDisplay is imported from ./sanitize.js (shared utility)
 
 function containsHiddenReviewChars(value: string): boolean {
   return sanitizeForDisplay(value) !== value;
@@ -2781,7 +2886,12 @@ async function runExecutionRound(winner: SenatorConfig, turns: SessionTurn[], in
       const baseUrl = trimTrailingSlash(resolvedBaseUrl || "https://api.openai.com/v1");
       const auth =
         winner.provider === "custom" || winner.provider === "local"
-          ? { ok: true as const, apiKey: winner.apiKey?.trim() || "" }
+          ? {
+              ok: true as const,
+              // OpenAI-compatible providers may allow anonymous access, so we
+              // resolve the shared credential chain but do not require a key.
+              apiKey: resolveSenatorApiKey(winner) || "",
+            }
           : requireApiKey(winner, "execution", `${baseUrl}/chat/completions`);
       if (!auth.ok) {
         console.error(chalk.red(`Execution round skipped: ${auth.failure.message}`));
@@ -3391,7 +3501,7 @@ async function runMcpManagerCommand(): Promise<void> {
     const chosen = await select({
       message: "Choose a server to remove",
       options: [
-        ...serverNames.map((n) => ({ label: n, value: n })),
+        ...serverNames.map((n) => ({ label: sanitizeForDisplay(n), value: n })),
         { label: "Cancel and go back", value: CANCEL_FLOW_CHOICE },
       ],
     });
@@ -3402,7 +3512,7 @@ async function runMcpManagerCommand(): Promise<void> {
 
     delete appConfig.mcpServers[chosen];
     await saveAppConfig(appConfig);
-    console.log(chalk.green(`Removed MCP server "${chosen}".`));
+    console.log(chalk.green(`Removed MCP server "${sanitizeForDisplay(chosen)}".`));
     await mcpManager.shutdown();
     await mcpManager.initialize();
     await runMcpToolApprovalGate();
@@ -3448,7 +3558,7 @@ async function runMcpManagerCommand(): Promise<void> {
   };
   await saveAppConfig(appConfig);
 
-  console.log(chalk.green(`Added MCP server "${serverName.trim()}".`));
+  console.log(chalk.green(`Added MCP server "${sanitizeForDisplay(serverName.trim())}".`));
   await mcpManager.shutdown();
   await mcpManager.initialize();
   await runMcpToolApprovalGate();
@@ -3866,7 +3976,10 @@ async function runUpdateCommand(): Promise<never> {
  * that weren't part of the original approval.
  *
  * Approval state is stored in module-level variables (mcpApprovalMode,
- * mcpApprovedToolNames) and is never written to disk.
+ * mcpApprovedFingerprints) and is never written to disk.
+ *
+ * Approvals are keyed by SHA-256 fingerprint (server + name + description +
+ * schema) so that any mutation in tool identity forces re-approval.
  */
 async function runMcpToolApprovalGate(): Promise<void> {
   if (!mcpManager.hasTools) {
@@ -3876,17 +3989,24 @@ async function runMcpToolApprovalGate(): Promise<void> {
 
   const allTools = mcpManager.tools;
 
-  // ── Fast path: reapply cached decision when tool set hasn't grown ──
+  // Build a name → fingerprint map for the current tool set.
+  const fingerprintOf = new Map(
+    allTools.map((t) => [t.name, getMcpToolFingerprint(t)] as const),
+  );
+
+  // ── Fast path: reapply cached decision when tool set hasn't changed ──
   if (mcpApprovalMode !== null) {
     if (mcpApprovalMode === "disabled") {
       mcpManager.disableAllTools();
       return;
     }
 
-    // Find tools that are genuinely new (not in the previous approved set).
-    const newTools = mcpApprovalMode === "all"
-      ? allTools.filter((t) => !mcpApprovedToolNames.has(t.name))
-      : allTools.filter((t) => !mcpApprovedToolNames.has(t.name));
+    // A tool is "new" if its fingerprint is missing from the approved set.
+    // This catches genuinely new tools AND tools whose identity changed
+    // (server, description, or schema mutated while keeping the same name).
+    const newTools = allTools.filter(
+      (t) => !mcpApprovedFingerprints.has(fingerprintOf.get(t.name)!),
+    );
 
     if (newTools.length === 0) {
       // Same tool set — silently reapply.
@@ -3894,11 +4014,11 @@ async function runMcpToolApprovalGate(): Promise<void> {
       return;
     }
 
-    // New tools appeared — prompt only for the new ones.
+    // New or changed tools appeared — prompt only for those.
     console.log("");
-    console.log(chalk.bold.yellow(`MCP: ${newTools.length} new tool(s) detected:`));
+    console.log(chalk.bold.yellow(`MCP: ${newTools.length} new or changed tool(s) detected:`));
     for (const tool of newTools) {
-      console.log(chalk.dim(`  [${tool.serverName}] ${tool.name} — ${tool.description.slice(0, 80)}${tool.description.length > 80 ? "…" : ""}`));
+      console.log(chalk.dim(`  [${sanitizeForDisplay(tool.serverName)}] ${sanitizeForDisplay(tool.name)} — ${sanitizeForDisplay(tool.description).slice(0, 80)}${tool.description.length > 80 ? "…" : ""}`));
     }
     console.log("");
 
@@ -3921,27 +4041,30 @@ async function runMcpToolApprovalGate(): Promise<void> {
       const selected = await multiselect({
         message: "Select new tools to approve (space to toggle, enter to confirm)",
         options: newTools.map((t) => ({
-          label: `[${t.serverName}] ${t.name}`,
+          label: `[${sanitizeForDisplay(t.serverName)}] ${sanitizeForDisplay(t.name)}`,
           value: t.name,
-          hint: t.description.slice(0, 60),
+          hint: sanitizeForDisplay(t.description).slice(0, 60),
         })),
         required: false,
       });
 
       if (!isCancel(selected) && Array.isArray(selected)) {
         for (const name of selected as string[]) {
-          mcpApprovedToolNames.add(name);
+          const fp = fingerprintOf.get(name);
+          if (fp) mcpApprovedFingerprints.add(fp);
         }
       }
     } else {
-      // "all" — add every new tool to the approved set.
+      // "all" — add every new tool's fingerprint to the approved set.
       for (const tool of newTools) {
-        mcpApprovedToolNames.add(tool.name);
+        mcpApprovedFingerprints.add(fingerprintOf.get(tool.name)!);
       }
     }
 
     applyMcpApproval(allTools);
-    const approvedCount = mcpApprovalMode === "all" ? allTools.length : mcpApprovedToolNames.size;
+    const approvedCount = allTools.filter(
+      (t) => mcpApprovedFingerprints.has(fingerprintOf.get(t.name)!),
+    ).length;
     console.log(chalk.green(`${approvedCount} tool(s) approved for this session.`));
     return;
   }
@@ -3950,7 +4073,7 @@ async function runMcpToolApprovalGate(): Promise<void> {
   console.log("");
   console.log(chalk.bold.yellow(`MCP: ${allTools.length} tool(s) passed safety filter:`));
   for (const tool of allTools) {
-    console.log(chalk.dim(`  [${tool.serverName}] ${tool.name} — ${tool.description.slice(0, 80)}${tool.description.length > 80 ? "…" : ""}`));
+    console.log(chalk.dim(`  [${sanitizeForDisplay(tool.serverName)}] ${sanitizeForDisplay(tool.name)} — ${sanitizeForDisplay(tool.description).slice(0, 80)}${tool.description.length > 80 ? "…" : ""}`));
   }
   console.log("");
 
@@ -3965,7 +4088,7 @@ async function runMcpToolApprovalGate(): Promise<void> {
 
   if (isCancel(action) || action === "none") {
     mcpApprovalMode = "disabled";
-    mcpApprovedToolNames.clear();
+    mcpApprovedFingerprints.clear();
     mcpManager.disableAllTools();
     console.log(chalk.dim("MCP tools disabled for this session."));
     return;
@@ -3975,38 +4098,42 @@ async function runMcpToolApprovalGate(): Promise<void> {
     const selected = await multiselect({
       message: "Select tools to approve (space to toggle, enter to confirm)",
       options: allTools.map((t) => ({
-        label: `[${t.serverName}] ${t.name}`,
+        label: `[${sanitizeForDisplay(t.serverName)}] ${sanitizeForDisplay(t.name)}`,
         value: t.name,
-        hint: t.description.slice(0, 60),
+        hint: sanitizeForDisplay(t.description).slice(0, 60),
       })),
       required: false,
     });
 
     if (isCancel(selected) || !Array.isArray(selected) || selected.length === 0) {
       mcpApprovalMode = "disabled";
-      mcpApprovedToolNames.clear();
+      mcpApprovedFingerprints.clear();
       mcpManager.disableAllTools();
       console.log(chalk.dim("MCP tools disabled for this session."));
       return;
     }
 
     mcpApprovalMode = "selected";
-    mcpApprovedToolNames = new Set(selected as string[]);
+    mcpApprovedFingerprints = new Set(
+      (selected as string[]).map((name) => fingerprintOf.get(name)!),
+    );
     applyMcpApproval(allTools);
-    console.log(chalk.green(`Approved ${mcpApprovedToolNames.size} tool(s) for this session.`));
+    console.log(chalk.green(`Approved ${mcpApprovedFingerprints.size} tool(s) for this session.`));
     return;
   }
 
   // "all" — approve everything.
   mcpApprovalMode = "all";
-  mcpApprovedToolNames = new Set(allTools.map((t) => t.name));
+  mcpApprovedFingerprints = new Set(allTools.map((t) => fingerprintOf.get(t.name)!));
   applyMcpApproval(allTools);
   console.log(chalk.green(`Approved all ${allTools.length} tool(s) for this session.`));
 }
 
 /**
  * Applies the cached MCP approval decision to the current tool set.
- * Always installs the per-call transparency logger.
+ * Derives the set of approved tool names from fingerprint matches so that
+ * name-only identity changes are correctly rejected. Always installs the
+ * per-call transparency logger.
  */
 function applyMcpApproval(allTools: readonly import("./mcp.js").McpTool[]): void {
   if (mcpApprovalMode === "disabled") {
@@ -4014,14 +4141,19 @@ function applyMcpApproval(allTools: readonly import("./mcp.js").McpTool[]): void
     return;
   }
 
-  if (mcpApprovalMode === "selected") {
-    mcpManager.restrictToTools(mcpApprovedToolNames);
-  }
-  // "all" mode: no restriction needed, all tools remain available.
+  // Derive approved names by matching current tools against stored fingerprints.
+  // This ensures a tool whose description/schema changed (new fingerprint) is
+  // NOT included even if its name was previously approved.
+  const approvedNames = new Set(
+    allTools
+      .filter((t) => mcpApprovedFingerprints.has(getMcpToolFingerprint(t)))
+      .map((t) => t.name),
+  );
+  mcpManager.restrictToTools(approvedNames);
 
   // Per-call transparency logger — always active when tools are enabled.
   mcpManager.onBeforeToolCall = (toolName, serverName) => {
-    console.log(chalk.dim(`  ⚙ MCP tool call: ${toolName} [${serverName}]`));
+    console.log(chalk.dim(`  ⚙ MCP tool call: ${sanitizeForDisplay(toolName)} [${sanitizeForDisplay(serverName)}]`));
   };
 }
 

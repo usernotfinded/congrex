@@ -29,11 +29,13 @@
  *   7. Stale tool cleanup — disconnected servers have their tools purged
  */
 
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { getConfigDir } from "./config.js";
+import { sanitizeForDisplay } from "./sanitize.js";
 import { APP_VERSION } from "./version.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -449,6 +451,62 @@ function extractTextFromResult(result: unknown): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  TOOL APPROVAL FINGERPRINTING
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Approvals must bind to the *full identity* of a tool — not just its name.
+// A server can change a tool's description or input schema while keeping
+// the same name, and a name-only approval cache would silently reuse the
+// stale approval. We compute a SHA-256 fingerprint over a deterministic
+// serialization of (serverName, toolName, description, inputSchema). Any
+// mutation in any of those fields produces a new fingerprint, forcing the
+// user to re-approve.
+
+/**
+ * Produces a deterministic JSON string from an arbitrary value.
+ * Object keys are sorted recursively so output is stable regardless of
+ * insertion order. This is critical for fingerprint consistency — two
+ * schemas `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` must produce the
+ * same serialization.
+ */
+export function deterministicJsonStringify(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null) return "null";
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return "[" + value.map(deterministicJsonStringify).join(",") + "]";
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return (
+    "{" +
+    keys
+      .map((k) => JSON.stringify(k) + ":" + deterministicJsonStringify(obj[k]))
+      .join(",") +
+    "}"
+  );
+}
+
+/**
+ * Computes a stable approval fingerprint for an MCP tool.
+ * Binds the approval to the tool's full identity — server origin, name,
+ * description, and input schema. Any change in any field invalidates
+ * the previous approval and forces re-prompting.
+ *
+ * Format: SHA-256 hex digest of the deterministic JSON serialization of
+ * `{ description, inputSchema, name, serverName }` (sorted keys).
+ */
+export function getMcpToolFingerprint(tool: McpTool): string {
+  const payload = deterministicJsonStringify({
+    serverName: tool.serverName,
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  });
+  return createHash("sha256").update(payload).digest("hex");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  McpManager
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -665,7 +723,7 @@ export class McpManager {
           await client.close();
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
-          console.error(`MCP: error closing "${name}": ${msg}`);
+          console.error(`MCP: error closing "${sanitizeForDisplay(name)}": ${sanitizeForDisplay(msg)}`);
         }
       }),
     );
@@ -721,7 +779,7 @@ export class McpManager {
         const message = result.reason instanceof Error
           ? result.reason.message
           : String(result.reason);
-        console.error(`MCP: failed to connect to "${name}": ${message}`);
+        console.error(`MCP: failed to connect to "${sanitizeForDisplay(name)}": ${sanitizeForDisplay(message)}`);
         this.trackServerError(name, message);
       }
     }
@@ -813,8 +871,8 @@ export class McpManager {
           if (this.toolIndex.has(tool.name)) {
             const owner = this.toolIndex.get(tool.name)!;
             console.error(
-              `MCP: tool name collision — "${tool.name}" from "${serverName}" ` +
-              `conflicts with "${owner}"; skipping duplicate`,
+              `MCP: tool name collision — "${sanitizeForDisplay(tool.name)}" from "${sanitizeForDisplay(serverName)}" ` +
+              `conflicts with "${sanitizeForDisplay(owner)}"; skipping duplicate`,
             );
             continue;
           }
@@ -840,13 +898,13 @@ export class McpManager {
 
         if (blocked > 0) {
           console.error(
-            `MCP: "${serverName}" — ${accepted} tool(s) available, ` +
+            `MCP: "${sanitizeForDisplay(serverName)}" — ${accepted} tool(s) available, ` +
             `${blocked} blocked by safety filter`,
           );
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`MCP: failed to list tools from "${serverName}": ${message}`);
+        console.error(`MCP: failed to list tools from "${sanitizeForDisplay(serverName)}": ${sanitizeForDisplay(message)}`);
         this.trackServerError(serverName, message);
       }
     }
