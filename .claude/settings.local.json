@@ -22,7 +22,8 @@
       "Bash(npm run:*)",
       "Bash(npm test:*)",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(wc -l /Users/natanmucelli/Desktop/prog/congrex/src/*.ts)"
     ]
   }
 }

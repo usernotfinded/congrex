@@ -158,3 +158,76 @@ test("new-tool detection treats changed semantics as new even when the name matc
 
   assert.deepEqual(detectNewTools([changedTool], approvedFingerprints), [changedTool]);
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Disabled-mode memory: mcpDisabledSeenFingerprints
+// ═══════════════════════════════════════════════════════════════════════
+//
+// When the user disables MCP, the runtime snapshots the current tool
+// fingerprints into a separate "disabled seen" set. The disabled-state
+// check compares against this set — NOT against mcpApprovedFingerprints
+// (which is empty in disabled mode). This prevents both:
+//   • treating every existing tool as "new" on every gate call
+//   • silently ignoring genuinely new tools from a newly added server
+
+test("disabled state with unchanged tool set does not trigger re-prompt", () => {
+  // Simulates: user disables MCP when tools [A, B] exist.
+  // On the next gate call the same tools [A, B] are discovered.
+  // Detection should find zero new tools → no re-prompt.
+  const toolA = makeTool({ name: "toolA" });
+  const toolB = makeTool({ name: "toolB", serverName: "server-two" });
+
+  // Snapshot taken at disable time — contains both fingerprints.
+  const disabledSeen = new Set([
+    getMcpToolFingerprint(toolA),
+    getMcpToolFingerprint(toolB),
+  ]);
+
+  const newTools = detectNewTools([toolA, toolB], disabledSeen);
+  assert.equal(newTools.length, 0, "same tool set should not trigger a prompt");
+});
+
+test("disabled state detects genuinely new tool from added server", () => {
+  // Simulates: user disabled MCP when only [A] existed.
+  // A new server is added, providing tool [B].
+  // Detection should flag [B] as new.
+  const toolA = makeTool({ name: "toolA" });
+  const toolB = makeTool({
+    serverName: "newly-added-server",
+    name: "listProjects",
+    description: "Lists all projects in the workspace",
+  });
+
+  const disabledSeen = new Set([getMcpToolFingerprint(toolA)]);
+
+  const newTools = detectNewTools([toolA, toolB], disabledSeen);
+  assert.equal(newTools.length, 1, "new tool must be detected");
+  assert.equal(newTools[0].name, "listProjects");
+});
+
+test("disabled state after user declines review: same tools do not re-prompt", () => {
+  // Simulates: user was prompted about [B] and declined.
+  // The disabled-seen set is updated to include [A, B].
+  // On the next gate call with [A, B], zero new tools → no re-prompt.
+  const toolA = makeTool({ name: "toolA" });
+  const toolB = makeTool({ name: "listProjects", serverName: "new-server" });
+
+  // After declining, the seen set is updated to include both.
+  const updatedDisabledSeen = new Set([
+    getMcpToolFingerprint(toolA),
+    getMcpToolFingerprint(toolB),
+  ]);
+
+  const newTools = detectNewTools([toolA, toolB], updatedDisabledSeen);
+  assert.equal(newTools.length, 0, "declined tools should not trigger repeated prompts");
+});
+
+test("disabled state after user accepts review: approved tools are not flagged again", () => {
+  // Simulates: user accepted review, approved tool A.
+  // On the next gate call (now in "all"/"selected" mode), tool A should
+  // not be flagged as new since its fingerprint is in the approved set.
+  const toolA = makeTool({ name: "toolA" });
+  const reApproved = new Set([getMcpToolFingerprint(toolA)]);
+
+  assert.deepEqual(detectNewTools([toolA], reApproved), []);
+});

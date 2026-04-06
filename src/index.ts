@@ -330,6 +330,10 @@ const congrexExecutor = new CongrexExecutor();
 // so that any change in tool identity forces re-approval.
 let mcpApprovalMode: "all" | "selected" | "disabled" | null = null;
 let mcpApprovedFingerprints = new Set<string>();
+// Fingerprints of tools that were present when the user chose "disable" (or
+// declined a subsequent review prompt). Used to distinguish genuinely new tools
+// from tools the user already saw and chose to ignore.
+let mcpDisabledSeenFingerprints = new Set<string>();
 
 const EXECUTION_SYSTEM_PROMPT =
   "You are the elected Executive within the Congrex Consensus Engine. The Senate has debated and reached a consensus. Implement the changes using the two available tools: edit_file for precise, surgical file modifications, and execute_command for tests, builds, git inspection, and safe terminal reads. edit_file takes {file_path, search, replace}. execute_command takes {command: [program, ...args], cwd?, timeout_ms?}. execute_command does NOT use a shell string, so never pass pipes, redirects, &&, or quoted shell snippets. Always verify your edits by running the relevant command after each change. Do not make unnecessary changes. When all changes are complete and verified, provide a brief summary.";
@@ -457,7 +461,7 @@ const mainPromptCommands = [
   { value: "/new", description: "start a fresh session" },
   { value: "/resume", description: "resume a previous session" },
   { value: "/copy", description: "copy last consensus to clipboard" },
-  { value: "/implement", description: "run Execution Round on the last winner answer" },
+  { value: "/implement", description: "run Execution Round (add instructions after, e.g. /implement add tests)" },
   { value: "/update", description: "update Congrex globally via npm" },
   { value: "/clear", description: "clear screen" },
   { value: "/wipe", description: "wipe all senators" },
@@ -3635,6 +3639,7 @@ async function runResumeSession(): Promise<SessionData | null> {
   const session = await loadSession(selected);
   if (!session) {
     console.log(chalk.red("Failed to load session. The file may be missing or invalid."));
+    console.log(chalk.dim("Start a new session with /new, or choose another entry with /resume."));
     return null;
   }
 
@@ -3706,8 +3711,8 @@ async function maybeWarnAboutResumedChamberMismatch(session: SessionData): Promi
 
   if (chamberSnapshotsDiffer(session.chamberSnapshot, currentSnapshot)) {
     console.log(
-      chalk.dim(
-        "This session was created under a different chamber. Transcript history was restored, but the next debate will use the current active senators and current Senate President.",
+      chalk.yellow(
+        "Chamber mismatch: this session was created with different senators. Your debate history was restored, but the next debate will use the current active chamber and Senate President.",
       ),
     );
   }
@@ -3814,8 +3819,9 @@ async function promptForDebateTopic(session: { current: SessionData }): Promise<
       continue;
     }
 
-    if (userPrompt === "/implement") {
-      await runStoredExecutionRound();
+    if (userPrompt === "/implement" || userPrompt.startsWith("/implement ")) {
+      const instruction = userPrompt.slice("/implement".length).trim() || undefined;
+      await runStoredExecutionRound(instruction);
       continue;
     }
 
@@ -3949,7 +3955,14 @@ async function runSession(): Promise<void> {
       session.current.chamberSnapshot = createSessionChamberSnapshot(activeSenators, appConfig.presidentId);
       await saveSession(session.current);
       if (judgeWinnerRequiresImplementation(debateResult.winner.answer)) {
-        await runStoredExecutionRound();
+        console.log("");
+        const startExec = await confirm({ message: "The winning answer includes implementation steps. Run Execution Round now?" });
+        if (!isCancel(startExec) && startExec) {
+          await runStoredExecutionRound();
+        } else {
+          console.log(chalk.dim("Skipped. Run /implement whenever you're ready."));
+          console.log("");
+        }
       } else {
         console.log(chalk.dim("No code changes requested."));
         console.log("");
@@ -3995,15 +4008,53 @@ async function runMcpToolApprovalGate(): Promise<void> {
   );
 
   // ── Fast path: reapply cached decision when tool set hasn't changed ──
-  if (mcpApprovalMode !== null) {
-    if (mcpApprovalMode === "disabled") {
+
+  // Handle the "disabled" state first: if new tools appeared since the user
+  // disabled MCP, offer a chance to review instead of silently staying disabled.
+  // Compare against mcpDisabledSeenFingerprints (the tools that were present
+  // when the user disabled or last declined review), NOT mcpApprovedFingerprints
+  // (which is empty in disabled mode).
+  if (mcpApprovalMode === "disabled") {
+    const currentFingerprints = new Set(fingerprintOf.values());
+    const newToolsSinceDisable = allTools.filter(
+      (t) => !mcpDisabledSeenFingerprints.has(fingerprintOf.get(t.name)!),
+    );
+
+    if (newToolsSinceDisable.length === 0) {
+      // No new tools — stay disabled silently.
       mcpManager.disableAllTools();
       return;
     }
 
-    // A tool is "new" if its fingerprint is missing from the approved set.
-    // This catches genuinely new tools AND tools whose identity changed
-    // (server, description, or schema mutated while keeping the same name).
+    console.log("");
+    console.log(
+      chalk.yellow(
+        `MCP tools were previously disabled, but ${newToolsSinceDisable.length} new tool(s) are now available:`,
+      ),
+    );
+    for (const tool of newToolsSinceDisable) {
+      console.log(chalk.dim(`  [${sanitizeForDisplay(tool.serverName)}] ${sanitizeForDisplay(tool.name)} — ${sanitizeForDisplay(tool.description).slice(0, 80)}${tool.description.length > 80 ? "…" : ""}`));
+    }
+    console.log("");
+
+    const reviewNow = await confirm({ message: "Review and approve MCP tools now?" });
+    if (!isCancel(reviewNow) && reviewNow) {
+      // Reset so the first-time approval flow below runs.
+      mcpApprovalMode = null;
+      mcpApprovedFingerprints.clear();
+      mcpDisabledSeenFingerprints.clear();
+    } else {
+      // Update the seen set so these same tools don't trigger repeated prompts.
+      mcpDisabledSeenFingerprints = currentFingerprints;
+      mcpManager.disableAllTools();
+      console.log(chalk.dim("MCP tools remain disabled for this session."));
+      return;
+    }
+  }
+
+  // Incremental path: reapply the "all" or "selected" decision, prompting only
+  // for tools whose fingerprint is not in the approved set.
+  if (mcpApprovalMode === "all" || mcpApprovalMode === "selected") {
     const newTools = allTools.filter(
       (t) => !mcpApprovedFingerprints.has(fingerprintOf.get(t.name)!),
     );
@@ -4089,6 +4140,7 @@ async function runMcpToolApprovalGate(): Promise<void> {
   if (isCancel(action) || action === "none") {
     mcpApprovalMode = "disabled";
     mcpApprovedFingerprints.clear();
+    mcpDisabledSeenFingerprints = new Set(fingerprintOf.values());
     mcpManager.disableAllTools();
     console.log(chalk.dim("MCP tools disabled for this session."));
     return;
@@ -4108,6 +4160,7 @@ async function runMcpToolApprovalGate(): Promise<void> {
     if (isCancel(selected) || !Array.isArray(selected) || selected.length === 0) {
       mcpApprovalMode = "disabled";
       mcpApprovedFingerprints.clear();
+      mcpDisabledSeenFingerprints = new Set(fingerprintOf.values());
       mcpManager.disableAllTools();
       console.log(chalk.dim("MCP tools disabled for this session."));
       return;
