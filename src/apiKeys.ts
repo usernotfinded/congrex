@@ -5,6 +5,7 @@ export const providerEnvVarNames: Partial<Record<Provider, readonly string[]>> =
   anthropic: ["ANTHROPIC_API_KEY"],
   google: ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
   xai: ["XAI_API_KEY"],
+  openrouter: ["OPENROUTER_API_KEY"],
 };
 
 export function resolveProviderEnvApiKey(

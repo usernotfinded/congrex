@@ -27,6 +27,10 @@ import {
   setActiveSenators,
   removeSenatorById,
   updateSenator,
+  isManualEndpointProvider,
+  LOCAL_OPENAI_BASE_URL,
+  resolveProviderBaseUrl,
+  type ManualEndpointProvider,
   type Provider,
   type SenatorConfig,
   type SessionChamberSnapshot,
@@ -224,16 +228,18 @@ const providerLabels: Record<Provider, string> = {
   anthropic: "Anthropic",
   google: "Google",
   xai: "xAI",
-  custom: "Custom (OpenAI-compatible)",
+  openrouter: "OpenRouter",
+  custom: "Custom (OpenAI-compatible, advanced)",
   local: "Local AI (Ollama/LM Studio)",
 };
 
 const CUSTOM_MODEL_CHOICE = "__custom_model__";
 const CANCEL_FLOW_CHOICE = "__cancel_flow__";
-const LOCAL_OPENAI_BASE_URL = "http://127.0.0.1:11434/v1";
 const PREFLIGHT_TIMEOUT_MS = 1500;
 
-const MODEL_DATASETS: Record<Exclude<Provider, "custom" | "local">, readonly string[]> = {
+type CuratedModelProvider = Exclude<Provider, "custom" | "local" | "openrouter">;
+
+const MODEL_DATASETS: Record<CuratedModelProvider, readonly string[]> = {
   openai: [
     "gpt-5.4",
     "gpt-5.4-pro",
@@ -263,18 +269,13 @@ const MODEL_DATASETS: Record<Exclude<Provider, "custom" | "local">, readonly str
   ],
 };
 
-const defaultModels: Record<Provider, string> = {
+const defaultModels: Record<Exclude<Provider, "openrouter">, string> = {
   openai: MODEL_DATASETS.openai[0],
   anthropic: MODEL_DATASETS.anthropic[0],
   google: MODEL_DATASETS.google[0],
   xai: MODEL_DATASETS.xai[0],
   custom: "llama3.2",
   local: "llama3.3",
-};
-
-const openAiCompatibleBaseUrls: Partial<Record<Provider, string>> = {
-  xai: "https://api.x.ai/v1",
-  local: LOCAL_OPENAI_BASE_URL,
 };
 
 const MAX_HISTORY_MESSAGES = 10;
@@ -660,7 +661,10 @@ function sanitizeBaseUrl(provider: Provider, raw: string): string {
   return url;
 }
 
-async function preflightBaseUrl(url: string): Promise<{ ok: true } | { ok: false; message: string; retry: boolean }> {
+async function preflightBaseUrl(
+  provider: ManualEndpointProvider,
+  url: string,
+): Promise<{ ok: true } | { ok: false; message: string; retry: boolean }> {
   try {
     const response = await fetch(`${url}/models`, {
       method: "GET",
@@ -674,7 +678,10 @@ async function preflightBaseUrl(url: string): Promise<{ ok: true } | { ok: false
     if (response.status === 404) {
       return {
         ok: false,
-        message: "Server reached, but endpoint not found. Did you forget the '/v1' suffix?",
+        message:
+          provider === "local"
+            ? "Server reached, but endpoint not found. Did you forget the '/v1' suffix?"
+            : "Endpoint reached, but `/models` was not found. Check that the URL points to the provider's OpenAI-compatible API root.",
         retry: true,
       };
     }
@@ -685,7 +692,10 @@ async function preflightBaseUrl(url: string): Promise<{ ok: true } | { ok: false
     if (nodeError.cause && typeof nodeError.cause === "object" && "code" in nodeError.cause && (nodeError.cause as { code?: string }).code === "ECONNREFUSED") {
       return {
         ok: false,
-        message: "Connection refused. Is your local AI server (Ollama/LM Studio) running on this port?",
+        message:
+          provider === "local"
+            ? "Connection refused. Is your local AI server (Ollama/LM Studio) running on this port?"
+            : "Connection refused. Check the hostname and port for your custom endpoint.",
         retry: true,
       };
     }
@@ -693,7 +703,10 @@ async function preflightBaseUrl(url: string): Promise<{ ok: true } | { ok: false
     if (nodeError.name === "TimeoutError") {
       return {
         ok: false,
-        message: `Server did not respond within ${PREFLIGHT_TIMEOUT_MS}ms. Check the URL and ensure the server is running.`,
+        message:
+          provider === "local"
+            ? `Server did not respond within ${PREFLIGHT_TIMEOUT_MS}ms. Check the URL and ensure the server is running.`
+            : `Endpoint did not respond within ${PREFLIGHT_TIMEOUT_MS}ms. Check the URL and ensure the provider is reachable.`,
         retry: true,
       };
     }
@@ -1134,7 +1147,7 @@ async function promptForMainInput(placeholder: string): Promise<string | symbol>
 }
 
 function resolveOpenAiBaseUrl(senator: SenatorConfig): string | undefined {
-  return senator.baseUrl || openAiCompatibleBaseUrls[senator.provider];
+  return resolveProviderBaseUrl(senator.provider, senator.baseUrl);
 }
 
 function buildOpenAiCompatibleHeaders(apiKey?: string): Record<string, string> {
@@ -1328,8 +1341,21 @@ async function promptForProvider(initialValue?: Provider): Promise<Provider | nu
       { label: providerLabels.anthropic, value: "anthropic" },
       { label: providerLabels.google, value: "google" },
       { label: providerLabels.xai, value: "xai" },
-      { label: providerLabels.local, value: "local" },
-      { label: providerLabels.custom, value: "custom" },
+      {
+        label: providerLabels.openrouter,
+        value: "openrouter",
+        hint: "First-class hosted provider with a built-in base URL",
+      },
+      {
+        label: providerLabels.local,
+        value: "local",
+        hint: "For Ollama, LM Studio, and similar local OpenAI-compatible servers",
+      },
+      {
+        label: providerLabels.custom,
+        value: "custom",
+        hint: "Advanced: bring your own OpenAI-compatible endpoint and base URL",
+      },
       { label: "Cancel and go back", value: CANCEL_FLOW_CHOICE },
     ],
     initialValue,
@@ -1486,12 +1512,25 @@ async function promptForApiKey(
 }
 
 async function promptForModel(provider: Provider, initialModelId?: string): Promise<string | null> {
-  if (provider === "custom" || provider === "local") {
+  if (provider === "custom" || provider === "local" || provider === "openrouter") {
+    const defaultModelId =
+      provider === "custom" || provider === "local"
+        ? defaultModels[provider]
+        : undefined;
     const value = await text({
-      message: provider === "local" ? "Local Model Name" : "Model ID",
-      initialValue: initialModelId || defaultModels[provider],
+      message:
+        provider === "local"
+          ? "Local Model Name"
+          : provider === "openrouter"
+            ? "OpenRouter Model ID"
+            : "Custom Provider Model ID",
+      initialValue: initialModelId || defaultModelId,
       placeholder:
-        provider === "local" ? "llama3.3, mistral, deepseek-r1" : "llama3.2, mistral-small, qwen2.5-coder",
+        provider === "local"
+          ? "llama3.3, mistral, deepseek-r1"
+          : provider === "openrouter"
+            ? "openai/gpt-4o-mini, anthropic/claude-sonnet-4, google/gemini-2.5-pro"
+            : "provider/model-name or your endpoint's model ID",
       validate: (input) => (!input.trim() ? "A model ID is required." : undefined),
     });
 
@@ -1545,14 +1584,29 @@ async function promptForModel(provider: Provider, initialModelId?: string): Prom
   return value.trim();
 }
 
-async function promptForBaseUrl(provider: Provider, initialValue?: string): Promise<string | null> {
+function getBaseUrlPromptCopy(provider: ManualEndpointProvider): { message: string; placeholder: string } {
+  if (provider === "local") {
+    return {
+      message: "Local AI base URL",
+      placeholder: LOCAL_OPENAI_BASE_URL,
+    };
+  }
+
+  return {
+    message: "Custom OpenAI-compatible base URL",
+    placeholder: "https://api.example.com/v1",
+  };
+}
+
+async function promptForBaseUrl(provider: ManualEndpointProvider, initialValue?: string): Promise<string | null> {
   let nextInitialValue = initialValue;
+  const promptCopy = getBaseUrlPromptCopy(provider);
 
   while (true) {
     const value = await text({
-      message: "OpenAI-compatible base URL",
+      message: promptCopy.message,
       initialValue: nextInitialValue,
-      placeholder: "http://127.0.0.1:11434/v1",
+      placeholder: promptCopy.placeholder,
       validate: (input) => {
         try {
           const url = new URL(input.trim());
@@ -1569,17 +1623,15 @@ async function promptForBaseUrl(provider: Provider, initialValue?: string): Prom
 
     const sanitized = sanitizeBaseUrl(provider, value);
 
-    if (provider === "local" || provider === "custom") {
-      const preflight = await preflightBaseUrl(sanitized);
-      if (!preflight.ok) {
-        if (preflight.message.startsWith("Connection refused")) {
-          console.log(chalk.red(preflight.message));
-        } else {
-          console.log(chalk.yellow(preflight.message));
-        }
-        nextInitialValue = sanitized;
-        continue;
+    const preflight = await preflightBaseUrl(provider, sanitized);
+    if (!preflight.ok) {
+      if (preflight.message.startsWith("Connection refused")) {
+        console.log(chalk.red(preflight.message));
+      } else {
+        console.log(chalk.yellow(preflight.message));
       }
+      nextInitialValue = sanitized;
+      continue;
     }
 
     return sanitized;
@@ -1910,6 +1962,7 @@ async function generateWithSenator(
   switch (senator.provider) {
     case "openai":
     case "xai":
+    case "openrouter":
     case "custom":
     case "local": {
       const resolvedBaseUrl = resolveOpenAiBaseUrl(senator);
@@ -2884,6 +2937,7 @@ async function runExecutionRound(winner: SenatorConfig, turns: SessionTurn[], in
     // ── OpenAI-compatible providers ──────────────────────────────────
     case "openai":
     case "xai":
+    case "openrouter":
     case "custom":
     case "local": {
       const resolvedBaseUrl = resolveOpenAiBaseUrl(winner);
@@ -3186,15 +3240,6 @@ async function runAddSenator(): Promise<SenatorConfig | null> {
     return null;
   }
 
-  const baseUrl =
-    provider === "custom" || provider === "local"
-      ? await promptForBaseUrl(provider, provider === "local" ? LOCAL_OPENAI_BASE_URL : undefined)
-      : undefined;
-  if ((provider === "custom" || provider === "local") && !baseUrl) {
-    notifyOperationCancelled();
-    return null;
-  }
-
   const keyResult = provider === "local" ? { apiKey: undefined } : await promptForApiKey(provider);
   if (keyResult === null) {
     notifyOperationCancelled();
@@ -3203,6 +3248,15 @@ async function runAddSenator(): Promise<SenatorConfig | null> {
 
   const modelId = await promptForModel(provider);
   if (!modelId) {
+    notifyOperationCancelled();
+    return null;
+  }
+
+  const baseUrl =
+    isManualEndpointProvider(provider)
+      ? await promptForBaseUrl(provider, provider === "local" ? LOCAL_OPENAI_BASE_URL : undefined)
+      : undefined;
+  if (isManualEndpointProvider(provider) && !baseUrl) {
     notifyOperationCancelled();
     return null;
   }
@@ -3280,8 +3334,22 @@ async function runEditSenator(): Promise<void> {
     return;
   }
 
+  const keyResult = provider === "local"
+    ? { apiKey: selectedSenator.apiKey, apiKeyEnvVar: selectedSenator.apiKeyEnvVar }
+    : await promptForApiKey(provider, selectedSenator.apiKey, selectedSenator.apiKeyEnvVar);
+  if (keyResult === null) {
+    notifyOperationCancelled();
+    return;
+  }
+
+  const modelId = await promptForModel(provider, selectedSenator.provider === provider ? selectedSenator.modelId : undefined);
+  if (!modelId) {
+    notifyOperationCancelled();
+    return;
+  }
+
   const baseUrl =
-    provider === "custom" || provider === "local"
+    isManualEndpointProvider(provider)
       ? await promptForBaseUrl(
           provider,
           provider === "local"
@@ -3293,21 +3361,7 @@ async function runEditSenator(): Promise<void> {
               : undefined,
         )
       : undefined;
-  if ((provider === "custom" || provider === "local") && !baseUrl) {
-    notifyOperationCancelled();
-    return;
-  }
-
-  const keyResult = provider === "local"
-    ? { apiKey: selectedSenator.apiKey, apiKeyEnvVar: selectedSenator.apiKeyEnvVar }
-    : await promptForApiKey(provider, selectedSenator.apiKey, selectedSenator.apiKeyEnvVar);
-  if (keyResult === null) {
-    notifyOperationCancelled();
-    return;
-  }
-
-  const modelId = await promptForModel(provider, selectedSenator.provider === provider ? selectedSenator.modelId : undefined);
-  if (!modelId) {
+  if (isManualEndpointProvider(provider) && !baseUrl) {
     notifyOperationCancelled();
     return;
   }

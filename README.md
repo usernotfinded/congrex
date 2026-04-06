@@ -1,4 +1,4 @@
-# Congrex AI Senate (v1.0.3)
+# Congrex AI Senate (v1.0.5)
 
 Congrex turns one prompt into a structured debate between multiple AI models, then promotes the strongest answer into an optional supervised execution round when implementation is actually needed.
 
@@ -20,9 +20,33 @@ You ask Congrex how to simplify a TypeScript build pipeline in an existing repo.
 
 - Node.js `>=20`
 - Rust toolchain (`cargo`) for building the local `congrex-executor` binary during installation
-- API keys for any hosted providers you want to use
+- API keys for any hosted providers you want to use, including OpenAI, Anthropic, Google, xAI, or OpenRouter
 - Optional local inference endpoint such as Ollama or LM Studio for `local` senators
 - At least 2 active senators and 1 designated Senate President before any debate can start
+
+## Providers
+
+Congrex supports these provider paths:
+
+- `OpenAI`, `Anthropic`, `Google`, and `xAI` as hosted providers with built-in defaults.
+- `OpenRouter` as a first-class hosted provider with a built-in base URL.
+- `Custom (OpenAI-compatible, advanced)` for manual OpenAI-compatible endpoints and base URLs.
+- `Local AI (Ollama/LM Studio)` for Ollama, LM Studio, and similar local OpenAI-compatible servers.
+
+### Provider setup
+
+- `OpenRouter`: choose `OpenRouter`, set `OPENROUTER_API_KEY` or configure an env var in Congrex, and enter the model ID you want to use. Normal setup does not ask for the OpenRouter base URL.
+- `Custom (OpenAI-compatible, advanced)`: use this when you need to point Congrex at a manual hosted endpoint. You provide the model ID and the provider's OpenAI-compatible base URL.
+- `Local AI (Ollama/LM Studio)`: use this for local inference servers. You provide the local model name and local base URL.
+
+Example OpenRouter setup:
+
+```bash
+export OPENROUTER_API_KEY=your_key_here
+congrex
+```
+
+Then choose `OpenRouter` in the provider picker and enter the model ID you want to route through OpenRouter.
 
 ## Installation
 
@@ -149,7 +173,7 @@ Congrex supports three credential sources. At runtime it resolves them in this o
 
 1. **`apiKeyEnvVar`** — a custom environment variable name stored per senator in `senators.json`. Congrex stores only the variable name, never the resolved secret value, and reads the key from the environment at runtime.
 2. **`apiKey`** — stored directly in `~/.config/congrex/senators.json`. The file is created with mode `0o600` (owner-only read/write), but the key itself is plaintext on disk.
-3. **Provider environment variables** — `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY` / `GEMINI_API_KEY`, `XAI_API_KEY`. These are used when no senator-specific source resolves to a key.
+3. **Provider environment variables** — `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY` / `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`. These are used when no senator-specific source resolves to a key.
 
 If both `apiKeyEnvVar` and `apiKey` are present, Congrex checks the custom environment variable first, then falls back to the stored `apiKey`, and finally to the provider default environment variable.
 

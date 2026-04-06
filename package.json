@@ -1,6 +1,6 @@
 {
   "name": "congrex",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "description": "Congrex AI Senate CLI with a Rust-backed secure execution layer.",
   "author": "Natan Mucelli",
   "license": "MIT",

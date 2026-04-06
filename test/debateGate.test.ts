@@ -68,6 +68,10 @@ test("hasHostedProvider returns true for xai senators", () => {
   assert.equal(hasHostedProvider([senatorWithProvider("xai")]), true);
 });
 
+test("hasHostedProvider returns true for openrouter senators", () => {
+  assert.equal(hasHostedProvider([senatorWithProvider("openrouter")]), true);
+});
+
 test("hasHostedProvider returns true for custom senators", () => {
   assert.equal(hasHostedProvider([senatorWithProvider("custom")]), true);
 });
@@ -97,6 +101,13 @@ test("canUseMcpToolsForDebate returns true only for fully local chambers", () =>
   );
   assert.equal(
     canUseMcpToolsForDebate([senatorWithProvider("local"), senatorWithProvider("openai")]),
+    false,
+  );
+});
+
+test("canUseMcpToolsForDebate disables MCP when openrouter participates", () => {
+  assert.equal(
+    canUseMcpToolsForDebate([senatorWithProvider("local"), senatorWithProvider("openrouter")]),
     false,
   );
 });

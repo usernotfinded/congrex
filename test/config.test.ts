@@ -3,15 +3,19 @@ import test from "node:test";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { resolveSenatorApiKey } from "../src/apiKeys.js";
+import { resolveProviderEnvApiKey, resolveSenatorApiKey } from "../src/apiKeys.js";
 import {
+  LOCAL_OPENAI_BASE_URL,
+  OPENROUTER_BASE_URL,
   createEmptySession,
   getConfigDir,
   getSenatorsFilePath,
+  isManualEndpointProvider,
   listRecentSessions,
   loadAppConfig,
   loadSenators,
   loadSession,
+  resolveProviderBaseUrl,
   saveAppConfig,
   saveSession,
   saveSenators,
@@ -109,6 +113,53 @@ test("loadSenators stays backward compatible when apiKeyEnvVar is missing", { co
   });
 });
 
+test("loadSenators accepts openrouter as a supported provider", { concurrency: false }, async () => {
+  await withTempConfigDir(async () => {
+    const senatorsFilePath = getSenatorsFilePath();
+    await mkdir(path.dirname(senatorsFilePath), { recursive: true });
+    await writeFile(
+      senatorsFilePath,
+      `${JSON.stringify({
+        version: 1,
+        senators: [
+          {
+            id: "openrouter-1",
+            name: "OpenRouter Senator",
+            provider: "openrouter",
+            modelId: "openai/gpt-4o-mini",
+            createdAt: "2026-04-05T00:00:00.000Z",
+          },
+        ],
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const loaded = await loadSenators();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0]?.provider, "openrouter");
+    assert.equal(loaded[0]?.modelId, "openai/gpt-4o-mini");
+  });
+});
+
+test("save/load roundtrip preserves openrouter senators without a manual base URL", { concurrency: false }, async () => {
+  await withTempConfigDir(async () => {
+    await saveSenators([
+      createSenator({
+        name: "OpenRouter Roundtrip",
+        provider: "openrouter",
+        modelId: "openai/gpt-4o-mini",
+        baseUrl: undefined,
+      }),
+    ]);
+
+    const loaded = await loadSenators();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0]?.provider, "openrouter");
+    assert.equal(loaded[0]?.modelId, "openai/gpt-4o-mini");
+    assert.equal(loaded[0]?.baseUrl, undefined);
+  });
+});
+
 test("apiKeyEnvVar takes precedence over apiKey, with deterministic fallback to apiKey and provider env vars", { concurrency: false }, () => {
   const senator = createSenator({
     apiKey: "stored-api-key",
@@ -161,6 +212,61 @@ test("custom OpenAI-compatible providers resolve apiKeyEnvVar before apiKey", { 
     resolveSenatorApiKey(customSenator, {}),
     "stored-custom-key",
   );
+});
+
+test("resolveProviderEnvApiKey recognizes OPENROUTER_API_KEY", { concurrency: false }, () => {
+  assert.equal(
+    resolveProviderEnvApiKey("openrouter", {
+      OPENROUTER_API_KEY: "openrouter-api-key",
+    }),
+    "openrouter-api-key",
+  );
+});
+
+test("openrouter providers follow apiKeyEnvVar -> apiKey -> OPENROUTER_API_KEY precedence", { concurrency: false }, () => {
+  const openrouterSenator = createSenator({
+    provider: "openrouter",
+    apiKey: "stored-openrouter-key",
+    apiKeyEnvVar: "CONGREX_OPENROUTER_KEY",
+  });
+
+  assert.equal(
+    resolveSenatorApiKey(openrouterSenator, {
+      CONGREX_OPENROUTER_KEY: "env-openrouter-key",
+      OPENROUTER_API_KEY: "provider-openrouter-key",
+    }),
+    "env-openrouter-key",
+  );
+
+  assert.equal(
+    resolveSenatorApiKey(openrouterSenator, {
+      OPENROUTER_API_KEY: "provider-openrouter-key",
+    }),
+    "stored-openrouter-key",
+  );
+
+  assert.equal(
+    resolveSenatorApiKey(
+      createSenator({
+        provider: "openrouter",
+        apiKeyEnvVar: "CONGREX_OPENROUTER_KEY",
+      }),
+      {
+        OPENROUTER_API_KEY: "openrouter-api-key",
+      },
+    ),
+    "openrouter-api-key",
+  );
+});
+
+test("provider base URL defaults keep openrouter hosted while custom remains manual", { concurrency: false }, () => {
+  assert.equal(resolveProviderBaseUrl("openrouter"), OPENROUTER_BASE_URL);
+  assert.equal(resolveProviderBaseUrl("openrouter", "https://override.example/v1"), "https://override.example/v1");
+  assert.equal(resolveProviderBaseUrl("custom"), undefined);
+  assert.equal(resolveProviderBaseUrl("local"), LOCAL_OPENAI_BASE_URL);
+  assert.equal(isManualEndpointProvider("custom"), true);
+  assert.equal(isManualEndpointProvider("local"), true);
+  assert.equal(isManualEndpointProvider("openrouter"), false);
 });
 
 test("local OpenAI-compatible providers resolve optional keys through the shared resolver", { concurrency: false }, () => {

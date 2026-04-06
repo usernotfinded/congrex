@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-export type Provider = "openai" | "anthropic" | "google" | "xai" | "custom" | "local";
+export type Provider = "openai" | "anthropic" | "google" | "xai" | "openrouter" | "custom" | "local";
+export type ManualEndpointProvider = Extract<Provider, "custom" | "local">;
 
 export interface SenatorConfig {
   id: string;
@@ -15,7 +16,7 @@ export interface SenatorConfig {
    * SECURITY NOTE: This stores the key in plaintext on disk at
    * ~/.config/congrex/senators.json (mode 0o600). For better security,
    * use environment variables instead:
-   *   - OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, XAI_API_KEY
+   *   - OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, OPENROUTER_API_KEY
    * These are resolved automatically by requireApiKey() when apiKey is empty.
    *
    * Alternatively, set `apiKeyEnvVar` to a custom env var name.
@@ -59,9 +60,24 @@ type LoadedSenatorRecord = {
 
 const STORE_VERSION = 1;
 const APP_NAME = "congrex";
-const SUPPORTED_PROVIDERS = new Set<Provider>(["openai", "anthropic", "google", "xai", "custom", "local"]);
+const SUPPORTED_PROVIDERS = new Set<Provider>(["openai", "anthropic", "google", "xai", "openrouter", "custom", "local"]);
+export const LOCAL_OPENAI_BASE_URL = "http://127.0.0.1:11434/v1";
+export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const OPENAI_COMPATIBLE_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
+  xai: "https://api.x.ai/v1",
+  openrouter: OPENROUTER_BASE_URL,
+  local: LOCAL_OPENAI_BASE_URL,
+};
 const ENV_VAR_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SECURE_FILE_MODE = 0o600;
+
+export function isManualEndpointProvider(provider: Provider): provider is ManualEndpointProvider {
+  return provider === "custom" || provider === "local";
+}
+
+export function resolveProviderBaseUrl(provider: Provider, configuredBaseUrl?: string): string | undefined {
+  return configuredBaseUrl || OPENAI_COMPATIBLE_PROVIDER_BASE_URLS[provider];
+}
 
 function normalizeOptionalEnvVarName(value: unknown): string | undefined {
   if (typeof value !== "string") {
