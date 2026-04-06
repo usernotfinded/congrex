@@ -22,6 +22,7 @@ const HOSTED_PROVIDERS: ReadonlySet<Provider> = new Set([
   "anthropic",
   "google",
   "xai",
+  "openrouter",
   "custom",
 ]);
 
