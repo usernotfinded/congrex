@@ -9,6 +9,7 @@ It is built for code and technical decision-making where a single model answer i
 - Compare multiple model answers on the same prompt instead of trusting one response.
 - Force a final chamber decision with a designated Senate President for tie-breaking.
 - Keep implementation optional: advice can stay advice, and code changes only happen in a supervised execution round.
+- Resume saved sessions, restore the last consensus/winner context, and continue with `/implement` when you are ready.
 - Stay local-first: senators, sessions, presets, and MCP configuration live on your machine.
 - Use defense-in-depth guardrails around file edits, command execution, MCP tools, and terminal output.
 
@@ -117,23 +118,25 @@ congrex
 - `/add` configure a new senator.
 - `/edit` update an existing senator.
 - `/remove` remove a senator from the roster.
-- `/boss` designate or change the mandatory Senate President required before debates can run.
+- `/boss` designate or change the mandatory Senate President required before debates can run. `/president` is an alias.
 - `/mcp` manage MCP tool servers.
 - `/preset` switch active senator rosters.
 - `/new` start a fresh session.
 - `/resume` resume a previous session.
 - `/copy` copy the latest consensus output to the clipboard.
-- `/implement` force the execution round on the last winner answer.
+- `/implement` force the execution round on the last winner answer. You can append extra instructions, for example `/implement add tests`.
 - `/update` update Congrex globally with `npm install -g congrex@latest`, then exit.
 - `/clear` clear the terminal screen.
-- `/wipe` remove all senators.
-- `/exit` quit Congrex.
+- `/wipe` remove all senators. `/reset` is an alias.
+- `/exit` quit Congrex. `/quit` is an alias.
 
 Congrex requires at least 2 active senators and 1 active Senate President before a debate can run. If the President is missing, Congrex stops and asks you to choose one immediately.
 
 Congrex does not impose a hard upper limit on active senators. More than 4 active senators is allowed, but it is strongly discouraged unless you explicitly want slower, more expensive debates.
 
 On startup, Congrex also performs a silent npm version check using `update-notifier`. If a newer package version is known, it shows a small non-blocking upgrade hint. Set `NO_UPDATE_NOTIFIER=1` to disable that check.
+
+When you resume a session, Congrex restores the saved debate history, the last consensus output, and the last winning senator context. That means you can use `/implement` immediately after `/resume` without rerunning the debate first. If the current active chamber or Senate President no longer matches the saved session, Congrex warns you before the next debate continues with the current chamber.
 
 ## Execution Model
 
@@ -195,6 +198,8 @@ On startup, and again after any MCP server add/remove, Congrex shows which MCP t
 
 Every approved MCP tool call is logged to the terminal for transparency.
 
+MCP tools are only exposed during debate when every participating senator uses a local provider. If any active senator uses a hosted provider such as OpenAI, Anthropic, Google, xAI, OpenRouter, or a custom hosted OpenAI-compatible endpoint, Congrex disables MCP tools for that debate to avoid forwarding tool definitions or tool results to third-party APIs.
+
 ### MCP tool filtering
 
 Tools go through a two-layer safety filter before they are offered for approval:
@@ -254,7 +259,7 @@ After both denylist layers pass, Congrex displays the full command, working dire
 
 ### Diagnostics
 
-The MCP manager maintains a rolling audit log of the last 200 tool invocations, including timestamps, durations, result sizes, and errors, plus per-server health metrics available through `getServerHealth()` and `getRecentAudit()`.
+The MCP manager maintains a rolling audit log of the last 200 tool invocations, including timestamps, durations, result sizes, and errors, plus per-server health metrics available through `getServerHealth()` and `getRecentAudit()`. Approved MCP calls are also echoed to the terminal as they happen.
 
 ### Privacy
 
