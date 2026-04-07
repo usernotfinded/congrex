@@ -22,6 +22,10 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check Rust executor compiles for Windows
+        working-directory: congrex-executor
+        run: cargo check --target x86_64-pc-windows-msvc --tests
+
       - name: Install Node dependencies
         run: npm ci --ignore-scripts
 

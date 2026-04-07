@@ -1118,10 +1118,11 @@ mod job_object {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE,
         };
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 
         /// This test only compiles on Windows, but it validates that the module
         /// structure and type references are correct.
@@ -1135,8 +1136,9 @@ mod job_object {
 
         fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
             unsafe {
-                let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-                if handle == 0 {
+                let handle =
+                    OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle.is_null() {
                     return true;
                 }
 
@@ -1149,8 +1151,9 @@ mod job_object {
 
         fn pid_is_running(pid: u32) -> bool {
             unsafe {
-                let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-                if handle == 0 {
+                let handle =
+                    OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle.is_null() {
                     return false;
                 }
 
@@ -1289,15 +1292,17 @@ mod tests {
         use std::process::Stdio;
         use tokio::time::timeout;
 
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE,
         };
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 
         fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
             unsafe {
-                let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-                if handle == 0 {
+                let handle =
+                    OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle.is_null() {
                     return true;
                 }
 
