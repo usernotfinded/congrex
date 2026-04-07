@@ -71,9 +71,10 @@ import {
   type WinnerSelection,
 } from "./consensus.js";
 import { getCommandBlockReason, isWarnProgram, BLOCKED_PROGRAMS, WARN_PROGRAMS, BLOCKED_ARG_PATTERNS } from "./commandSafety.js";
+import type { ChalkLike } from "./chalkLike.js";
 
 const require = createRequire(import.meta.url);
-const chalk: import("chalk").ChalkInstance = require("chalk");
+const chalk = require("chalk") as ChalkLike;
 const {
   cancel,
   confirm,

@@ -21,10 +21,11 @@
     "congrex-executor/src/**"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
+    "check:chalk-types": "node scripts/check-chalk-types.mjs",
+    "build": "npm run check:chalk-types && tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
     "dev": "tsx src/index.ts",
     "test": "node --import tsx --test test/**/*.test.ts",
-    "prepare": "tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
+    "prepare": "npm run check:chalk-types && tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
     "postinstall": "node scripts/postinstall.mjs"
   },
   "keywords": [

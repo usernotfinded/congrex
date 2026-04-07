@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import type { ChalkLike } from "../chalkLike.js";
 
 const require = createRequire(import.meta.url);
-const chalk: import("chalk").ChalkInstance = require("chalk");
+const chalk = require("chalk") as ChalkLike;
 const updateNotifier = require("update-notifier") as (options: {
   pkg: { name: string; version: string };
   updateCheckInterval: number;
