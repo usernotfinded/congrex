@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-# Congrex AI Senate (v1.0.4)
-=======
 # Congrex AI Senate (v1.0.5)
->>>>>>> 0765c69 (feat: add first-class OpenRouter support and release v1.0.5)
 
 Congrex turns one prompt into a structured debate between multiple AI models, then promotes the strongest answer into an optional supervised execution round when implementation is actually needed.
 
