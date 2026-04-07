@@ -9,3 +9,6 @@ congrex-executor/target/
 
 # Local OS files
 .DS_Store
+
+# AI agent config (local only)
+.claude/
