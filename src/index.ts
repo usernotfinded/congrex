@@ -60,10 +60,20 @@ import {
 } from "./sessionResume.js";
 import { initUpdateNotifier, runSelfUpdate } from "./utils/updateNotifier.js";
 import { APP_VERSION } from "./version.js";
+import {
+  chooseWinner,
+  buildCritiqueScores,
+  buildVoteCounts,
+  judgeWinnerRequiresImplementation,
+  type AnswerRecord,
+  type CritiqueRecord,
+  type VoteRecord,
+  type WinnerSelection,
+} from "./consensus.js";
+import { getCommandBlockReason, isWarnProgram, BLOCKED_PROGRAMS, WARN_PROGRAMS, BLOCKED_ARG_PATTERNS } from "./commandSafety.js";
 
 const require = createRequire(import.meta.url);
-const chalk = require("chalk") as any;
-const clackPromptsPath = fileURLToPath(new URL("../node_modules/@clack/prompts/dist/index.cjs", import.meta.url));
+const chalk: import("chalk").ChalkInstance = require("chalk");
 const {
   cancel,
   confirm,
@@ -74,28 +84,9 @@ const {
   password,
   select,
   text,
-} = require(clackPromptsPath) as typeof import("@clack/prompts");
+} = require("@clack/prompts") as typeof import("@clack/prompts");
 
-type VoteRecord = {
-  senatorId: string;
-  winnerId: string;
-  reason: string;
-};
 
-type CritiqueRecord = {
-  senatorId: string;
-  targetId: string;
-  strengths: string;
-  weaknesses: string;
-  score: number;
-};
-
-type AnswerRecord = {
-  senatorId: string;
-  senatorName: string;
-  modelId: string;
-  answer: string;
-};
 
 type OpenAiToolCall = {
   id: string;
@@ -188,11 +179,7 @@ type SenatorGenerationResult =
       failure: ArmoredFetchFailure;
     };
 
-type WinnerSelection = {
-  winner: AnswerRecord;
-  winnerId: string;
-  tieBreakNote?: string;
-};
+
 
 type DebateResult = {
   winner: AnswerRecord;
@@ -2422,149 +2409,7 @@ async function runVoteRound(
   return results.filter((result): result is VoteRecord => Boolean(result));
 }
 
-function buildConfigOrder(senators: SenatorConfig[]): Map<string, number> {
-  return new Map(senators.map((senator, index) => [senator.id, index]));
-}
 
-function buildCritiqueScores(answers: AnswerRecord[], critiques: CritiqueRecord[]): Map<string, number> {
-  const scores = new Map(answers.map((answer) => [answer.senatorId, 0]));
-
-  for (const critique of critiques) {
-    if (!scores.has(critique.targetId)) {
-      continue;
-    }
-
-    scores.set(critique.targetId, (scores.get(critique.targetId) || 0) + critique.score);
-  }
-
-  return scores;
-}
-
-function buildVoteCounts(answers: AnswerRecord[], votes: VoteRecord[]): Map<string, number> {
-  const counts = new Map(answers.map((answer) => [answer.senatorId, 0]));
-
-  for (const vote of votes) {
-    if (!counts.has(vote.winnerId)) {
-      continue;
-    }
-
-    counts.set(vote.winnerId, (counts.get(vote.winnerId) || 0) + 1);
-  }
-
-  return counts;
-}
-
-function pickFirstByConfiguration(candidateIds: string[], configOrder: Map<string, number>): string | undefined {
-  return [...candidateIds].sort((left, right) => (configOrder.get(left) || Number.MAX_SAFE_INTEGER) - (configOrder.get(right) || Number.MAX_SAFE_INTEGER))[0];
-}
-
-function resolveTieByPresidentialRule(
-  tiedCandidateIds: string[],
-  senators: SenatorConfig[],
-  votes: VoteRecord[],
-  answerById: Map<string, AnswerRecord>,
-  presidentId?: string,
-): WinnerSelection {
-  const configOrder = buildConfigOrder(senators);
-  const president = (presidentId ? senators.find((s) => s.id === presidentId) : undefined) || senators[0];
-  const presidentVote = votes.find((vote) => vote.senatorId === president?.id);
-  const presidentIsTied = Boolean(president && tiedCandidateIds.includes(president.id));
-
-  let winnerId: string | undefined =
-    presidentIsTied && presidentVote && tiedCandidateIds.includes(presidentVote.winnerId)
-      ? presidentVote.winnerId
-      : pickFirstByConfiguration(tiedCandidateIds, configOrder);
-
-  if (winnerId && !answerById.has(winnerId)) {
-    winnerId = pickFirstByConfiguration(
-      tiedCandidateIds.filter((candidateId) => answerById.has(candidateId)),
-      configOrder,
-    );
-  }
-
-  const winner = winnerId ? answerById.get(winnerId) : undefined;
-  if (!winner || !winnerId) {
-    const fallbackId = pickFirstByConfiguration([...answerById.keys()], configOrder);
-    const fallbackWinner = fallbackId ? answerById.get(fallbackId) : undefined;
-    if (!fallbackWinner) {
-      throw new Error("No valid tied winner could be resolved.");
-    }
-
-    return {
-      winner: fallbackWinner,
-      winnerId: fallbackWinner.senatorId,
-      tieBreakNote: `Tie-break applied: ${fallbackWinner.senatorName} designated as winner by Presidential Seniority.`,
-    };
-  }
-
-  return {
-    winner,
-    winnerId,
-    tieBreakNote: `Tie-break applied: ${winner.senatorName} designated as winner by Presidential Seniority.`,
-  };
-}
-
-function chooseWinner(
-  senators: SenatorConfig[],
-  answers: AnswerRecord[],
-  votes: VoteRecord[],
-  critiques: CritiqueRecord[],
-  presidentId?: string,
-): WinnerSelection {
-  const answerById = new Map(answers.map((answer) => [answer.senatorId, answer]));
-  const configOrder = buildConfigOrder(senators);
-
-  if (answers.length === 1) {
-    return {
-      winner: answers[0],
-      winnerId: answers[0].senatorId,
-    };
-  }
-
-  if (votes.length === 0) {
-    if (answers.length > 2) {
-      throw new Error("No consensus: no valid votes were cast in round 3.");
-    }
-
-    const critiqueScores = buildCritiqueScores(answers, critiques);
-    const topScore = Math.max(...answers.map((answer) => critiqueScores.get(answer.senatorId) || 0));
-    const tiedCandidates = answers.filter((answer) => (critiqueScores.get(answer.senatorId) || 0) === topScore);
-
-    if (tiedCandidates.length === 1) {
-      return {
-        winner: tiedCandidates[0],
-        winnerId: tiedCandidates[0].senatorId,
-      };
-    }
-
-    return resolveTieByPresidentialRule(
-      tiedCandidates.map((answer) => answer.senatorId),
-      senators,
-      votes,
-      answerById,
-      presidentId,
-    );
-  }
-
-  const voteCounts = buildVoteCounts(answers, votes);
-  const topVoteCount = Math.max(...answers.map((answer) => voteCounts.get(answer.senatorId) || 0));
-  const tiedCandidates = answers.filter((answer) => (voteCounts.get(answer.senatorId) || 0) === topVoteCount);
-
-  if (tiedCandidates.length === 1) {
-    return {
-      winner: tiedCandidates[0],
-      winnerId: tiedCandidates[0].senatorId,
-    };
-  }
-
-  return resolveTieByPresidentialRule(
-    tiedCandidates.map((answer) => answer.senatorId),
-    senators,
-    votes,
-    answerById,
-    presidentId,
-  );
-}
 
 function formatVoteSummary(
   votes: VoteRecord[],
@@ -2759,111 +2604,7 @@ async function approveAndExecuteEdit(args: EditFileArgs): Promise<string> {
   }
 }
 
-/**
- * [P2 FIX] TypeScript-side command denylist — defense-in-depth alongside the
- * Rust executor's own blocked_command_reason(). Programs in BLOCKED_PROGRAMS
- * are always rejected. Programs in WARN_PROGRAMS show an elevated warning.
- * Argument patterns in BLOCKED_ARG_PATTERNS are rejected for any program.
- *
- * The Rust executor has its own matching denylist. Both must pass.
- */
-const BLOCKED_PROGRAMS: ReadonlySet<string> = new Set([
-  // Privilege escalation
-  "sudo", "su", "doas", "pkexec", "runas",
-  // Interactive shells (arbitrary code execution)
-  "bash", "sh", "zsh", "fish", "csh", "tcsh", "ksh", "dash",
-  "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
-  // Execution wrappers / launchers (bypass denylist by wrapping real program)
-  "nohup", "env", "xargs", "nice", "ionice", "timeout", "stdbuf", "setsid",
-  "open", "xdg-open", "start",
-  // Background / scheduling / multiplexing
-  "screen", "tmux", "at", "batch", "crontab",
-  // Remote access / exfiltration
-  "ssh", "scp", "sftp", "rsync", "telnet", "ftp", "nc", "ncat", "netcat", "socat",
-  // Network data transfer
-  "curl", "wget", "httpie",
-  // macOS automation (can control any app, click UI, read screen)
-  "osascript", "automator",
-  // Disk / filesystem destruction
-  "dd", "mkfs", "fdisk", "parted", "diskutil", "format",
-  // System management
-  "systemctl", "service", "launchctl", "shutdown", "reboot", "halt", "init",
-  // Container / VM escape vectors
-  "docker", "podman", "kubectl", "vagrant", "virsh",
-  // Package managers (can install arbitrary code)
-  "apt", "apt-get", "yum", "dnf", "pacman", "brew", "pip", "pip3",
-  "gem", "cargo", "go",
-  // Credential access
-  "security", "keychain", "pass", "gpg",
-  // Compilers as code execution vectors (can run arbitrary code via -run, etc.)
-  "gcc", "g++", "clang", "clang++", "cc", "c++",
-]);
 
-const WARN_PROGRAMS: ReadonlySet<string> = new Set([
-  // These are sometimes legitimate but deserve extra scrutiny
-  "npm", "npx", "yarn", "pnpm", "bun",
-  "git", "gh",
-  "make", "cmake",
-]);
-
-/**
- * [P2 FIX] Argument patterns that are dangerous regardless of the program.
- * Catches shell injection attempts and inline code execution.
- */
-const BLOCKED_ARG_PATTERNS: readonly RegExp[] = [
-  // Shell operators that should never appear in argv-form commands
-  /[|;&`$]/, // pipe, semicolon, ampersand, backtick, dollar sign
-  />\s*/,    // output redirection
-  /<<?\s*/,  // input redirection / heredoc
-];
-
-function getCommandBlockReason(command: string[]): string | null {
-  const program = command[0].split("/").pop()?.toLowerCase().replace(/\.exe$/, "") || "";
-
-  if (BLOCKED_PROGRAMS.has(program)) {
-    return `Program "${program}" is blocked. It can be used for privilege escalation, remote access, or arbitrary code execution.`;
-  }
-
-  // Block interpreters with inline eval flags
-  const interpreters = new Set(["python", "python3", "node", "deno", "ruby", "perl", "php", "lua"]);
-  if (interpreters.has(program)) {
-    const evalFlags = new Set(["-c", "-e", "-p", "--eval", "--print", "-exec"]);
-    if (command.slice(1).some((arg) => evalFlags.has(arg))) {
-      return `Inline code execution via "${program}" is blocked. Run a script file instead.`;
-    }
-  }
-
-  // Block shell operators in arguments (shell injection via argv)
-  for (let i = 1; i < command.length; i++) {
-    for (const pattern of BLOCKED_ARG_PATTERNS) {
-      if (pattern.test(command[i])) {
-        return `Argument "${sanitizeForDisplay(command[i])}" contains shell operators. Use argv-form only, no pipes, redirects, or chaining.`;
-      }
-    }
-  }
-
-  // Block destructive git subcommands
-  if (program === "git") {
-    const subcommand = command[1]?.toLowerCase();
-    const destructiveGitOps = new Set([
-      "push", "clean", "reset", "rebase", "merge", "cherry-pick",
-      "rm", "mv", "remote", "config", "filter-branch",
-    ]);
-    if (subcommand && destructiveGitOps.has(subcommand)) {
-      return `"git ${subcommand}" is blocked during execution rounds. Only read-only git operations (status, log, diff, show, branch, etc.) are allowed.`;
-    }
-  }
-
-  // Block destructive find arguments
-  if (program === "find") {
-    const dangerousActions = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir"]);
-    if (command.slice(1).some((arg) => dangerousActions.has(arg))) {
-      return `"find" with mutation actions (-delete, -exec) is blocked.`;
-    }
-  }
-
-  return null;
-}
 
 async function approveAndExecuteCommand(args: ExecuteCommandArgs): Promise<string> {
   if (!Array.isArray(args.command) || args.command.length === 0 || args.command.some((part) => typeof part !== "string" || !part)) {
@@ -2894,9 +2635,9 @@ async function approveAndExecuteCommand(args: ExecuteCommandArgs): Promise<strin
   const timeoutMs = args.timeout_ms ?? EXECUTE_COMMAND_TIMEOUT_MS;
 
   // [P2 FIX] Show elevated warning for programs that deserve extra scrutiny.
-  const program = args.command[0].split("/").pop()?.toLowerCase().replace(/\.exe$/, "") || "";
-  if (WARN_PROGRAMS.has(program)) {
-    console.log(chalk.yellow.bold(`\n  ⚠  "${program}" can modify your project. Review carefully.`));
+  if (isWarnProgram(args.command)) {
+    const programName = args.command[0].split("/").pop()?.toLowerCase().replace(/\.exe$/, "") || "";
+    console.log(chalk.yellow.bold(`\n  ⚠  "${programName}" can modify your project. Review carefully.`));
   }
 
   displayCommandProposal(args.command, resolvedCwd, timeoutMs);
@@ -3701,16 +3442,7 @@ async function runResumeSession(): Promise<SessionData | null> {
   return session;
 }
 
-function judgeWinnerRequiresImplementation(answer: string): boolean {
-  const hasChangeVerb = /\b(add|create|modify|replace|refactor|delete|implement|rename|remove|update|edit|patch|write)\b/i.test(answer);
-  const hasCodeTarget = /\b(file|function|class|method|component|module|route|endpoint|test|feature|code|codebase)\b/i.test(answer);
-  const hasPathLikeTarget = /\b[a-z0-9_./-]+\.(ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|kt|swift|cpp|c|h|hpp|json|yml|yaml|md)\b/i.test(answer);
-  const hasFileDirective = /\b(in|into|inside)\s+[a-z0-9_./-]+\.(ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|kt|swift|cpp|c|h|hpp|json|yml|yaml|md)\b/i.test(answer);
-  const hasCreateFileDirective = /\b(create|add|write)\b.{0,30}\b(new )?file\b/i.test(answer);
-  const hasNamedCodeBlock = /```[^\n]*\n(?:.*\n){0,3}(?:file|path)\s*:/i.test(answer);
 
-  return hasFileDirective || hasCreateFileDirective || hasNamedCodeBlock || (hasChangeVerb && (hasCodeTarget || hasPathLikeTarget));
-}
 
 async function forceSelectBoss(reason?: string): Promise<boolean> {
   const senators = await loadSenators();
@@ -3881,6 +3613,7 @@ async function promptForDebateTopic(session: { current: SessionData }): Promise<
 
     if (userPrompt === "/update") {
       await runUpdateCommand();
+      return userPrompt;
     }
 
     if (userPrompt === "/clear") {
@@ -4025,7 +3758,7 @@ async function runSession(): Promise<void> {
   }
 }
 
-async function runUpdateCommand(): Promise<never> {
+async function runUpdateCommand(): Promise<void> {
   const status = runSelfUpdate();
   await congrexExecutor.dispose().catch(() => {});
   await mcpManager.shutdown().catch(() => {});
@@ -4272,10 +4005,13 @@ async function main(): Promise<void> {
   // [P1 FIX] Require human approval of MCP tools before any debate can use them.
   await runMcpToolApprovalGate();
 
-  const shutdownMcp = async (): Promise<void> => {
-    await mcpManager.shutdown();
+  const gracefulShutdown = async (): Promise<void> => {
+    await mcpManager.shutdown().catch(() => {});
+    await congrexExecutor.dispose().catch(() => {});
+    process.exit(0);
   };
-  process.on("exit", () => { shutdownMcp().catch(() => {}); });
+  process.on("SIGINT", () => { gracefulShutdown(); });
+  process.on("SIGTERM", () => { gracefulShutdown(); });
 
   const [, , command] = process.argv;
 

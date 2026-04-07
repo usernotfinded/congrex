@@ -27,7 +27,6 @@
     "prepare": "tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
     "postinstall": "node scripts/postinstall.mjs"
   },
-  "preferGlobal": true,
   "keywords": [
     "cli",
     "ai",

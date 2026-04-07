@@ -12,3 +12,7 @@ congrex-executor/target/
 
 # AI agent config (local only)
 .claude/
+.gemini/
+
+# Test artifacts
+congrex-executor/edit_test.txt

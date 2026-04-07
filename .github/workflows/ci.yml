@@ -5,9 +5,13 @@ on:
   pull_request:
 
 jobs:
-  verify-windows:
-    name: Verify on windows-latest
-    runs-on: windows-latest
+  verify:
+    name: Verify on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Check out repository
@@ -22,9 +26,9 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check Rust executor compiles for Windows
+      - name: Check Rust executor compiles
         working-directory: congrex-executor
-        run: cargo check --target x86_64-pc-windows-msvc --tests
+        run: cargo check --tests
 
       - name: Install Node dependencies
         run: npm ci --ignore-scripts
