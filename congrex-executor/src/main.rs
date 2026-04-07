@@ -1010,6 +1010,58 @@ fn kill_process_tree(child: &mut Child) {
     let _ = child.start_kill();
 }
 
+#[cfg(all(windows, test))]
+mod windows_test_support {
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    struct ProcessHandle(HANDLE);
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn open_process_for_wait(pid: u32) -> Option<ProcessHandle> {
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            );
+            (!handle.is_null()).then_some(ProcessHandle(handle))
+        }
+    }
+
+    fn wait_for_process(handle: &ProcessHandle, timeout: Duration) -> u32 {
+        let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        unsafe { WaitForSingleObject(handle.0, wait_ms) }
+    }
+
+    pub fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+        let Some(handle) = open_process_for_wait(pid) else {
+            return true;
+        };
+
+        wait_for_process(&handle, timeout) == WAIT_OBJECT_0
+    }
+
+    pub fn pid_is_running(pid: u32) -> bool {
+        let Some(handle) = open_process_for_wait(pid) else {
+            return false;
+        };
+
+        wait_for_process(&handle, Duration::ZERO) == WAIT_TIMEOUT
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Windows Job Object — ensures the entire process tree is terminated when the
 // Job Object handle is closed (on timeout, on drop, or on normal exit).
@@ -1113,16 +1165,12 @@ mod job_object {
 
     #[cfg(test)]
     mod tests {
+        use crate::windows_test_support::{pid_is_running, wait_for_pid_exit};
+
         use std::io::{self, BufRead, BufReader};
         use std::process::{Command, Stdio};
         use std::thread;
         use std::time::{Duration, Instant};
-
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE,
-        };
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 
         /// This test only compiles on Windows, but it validates that the module
         /// structure and type references are correct.
@@ -1132,35 +1180,6 @@ mod job_object {
             // we can verify the type exists and is Send (required for async).
             fn _assert_send<T: Send>() {}
             _assert_send::<super::JobObjectGuard>();
-        }
-
-        fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
-            unsafe {
-                let handle =
-                    OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-                if handle.is_null() {
-                    return true;
-                }
-
-                let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-                let status = WaitForSingleObject(handle, wait_ms);
-                CloseHandle(handle);
-                status == WAIT_OBJECT_0
-            }
-        }
-
-        fn pid_is_running(pid: u32) -> bool {
-            unsafe {
-                let handle =
-                    OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-                if handle.is_null() {
-                    return false;
-                }
-
-                let status = WaitForSingleObject(handle, 0);
-                CloseHandle(handle);
-                status == WAIT_TIMEOUT
-            }
         }
 
         fn wait_for_child_exit(
@@ -1238,6 +1257,9 @@ mod job_object {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    use crate::windows_test_support::wait_for_pid_exit;
+
     #[test]
     fn find_unique_match_works() {
         let (start, end) = find_unique_match("hello world", "world").unwrap();
@@ -1291,27 +1313,6 @@ mod tests {
     async fn windows_timeout_closes_job_and_kills_immediate_descendants() {
         use std::process::Stdio;
         use tokio::time::timeout;
-
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE,
-        };
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-
-        fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
-            unsafe {
-                let handle =
-                    OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-                if handle.is_null() {
-                    return true;
-                }
-
-                let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-                let status = WaitForSingleObject(handle, wait_ms);
-                CloseHandle(handle);
-                status == WAIT_OBJECT_0
-            }
-        }
 
         let script = concat!(
             "$ErrorActionPreference='Stop'; ",

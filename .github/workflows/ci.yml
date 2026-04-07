@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
@@ -26,9 +26,18 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check Rust executor compiles
+      - name: Check Rust executor compiles for native target
         working-directory: congrex-executor
         run: cargo check --tests
+
+      - name: Add Windows Rust target
+        if: matrix.os == 'ubuntu-latest'
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Check Rust executor compiles for Windows target
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: congrex-executor
+        run: cargo check --tests --target x86_64-pc-windows-msvc
 
       - name: Install Node dependencies
         run: npm ci --ignore-scripts
