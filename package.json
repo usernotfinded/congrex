@@ -24,7 +24,7 @@
     "check:chalk-types": "node scripts/check-chalk-types.mjs",
     "build": "npm run check:chalk-types && tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
     "dev": "tsx src/index.ts",
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
     "prepare": "npm run check:chalk-types && tsc -p tsconfig.json && node scripts/ensure-shebang.mjs",
     "postinstall": "node scripts/postinstall.mjs"
   },

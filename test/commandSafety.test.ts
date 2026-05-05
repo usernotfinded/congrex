@@ -29,6 +29,18 @@ describe("getCommandBlockReason — blocked programs", () => {
     assert.ok(getCommandBlockReason(["osascript", "-e", "tell application"]));
   });
 
+  it("blocks chmod", () => {
+    assert.ok(getCommandBlockReason(["chmod", "600", "secrets.txt"]));
+  });
+
+  it("blocks chown", () => {
+    assert.ok(getCommandBlockReason(["chown", "root", "secrets.txt"]));
+  });
+
+  it("blocks chgrp", () => {
+    assert.ok(getCommandBlockReason(["chgrp", "staff", "secrets.txt"]));
+  });
+
   it("allows ls", () => {
     assert.equal(getCommandBlockReason(["ls", "-la"]), null);
   });
@@ -79,6 +91,36 @@ describe("getCommandBlockReason — shell operators", () => {
 
   it("allows clean arguments", () => {
     assert.equal(getCommandBlockReason(["grep", "-r", "TODO", "src/"]), null);
+  });
+});
+
+// ─── Destructive rm flags ───────────────────────────────────────────
+
+describe("getCommandBlockReason — rm flags", () => {
+  it("blocks rm -rf", () => {
+    assert.ok(getCommandBlockReason(["rm", "-rf", "tmp"]));
+  });
+
+  it("blocks rm -fr", () => {
+    assert.ok(getCommandBlockReason(["rm", "-fr", "tmp"]));
+  });
+
+  it("blocks rm with split recursive and force flags", () => {
+    assert.ok(getCommandBlockReason(["rm", "-r", "-f", "tmp"]));
+  });
+
+  it("blocks rm with long recursive and force flags", () => {
+    assert.ok(getCommandBlockReason(["rm", "--recursive", "--force", "tmp"]));
+    assert.ok(getCommandBlockReason(["rm", "--force", "--recursive", "tmp"]));
+  });
+
+  it("blocks rm with uppercase recursive and force flags", () => {
+    assert.ok(getCommandBlockReason(["rm", "-Rf", "tmp"]));
+    assert.ok(getCommandBlockReason(["rm", "-R", "-f", "tmp"]));
+  });
+
+  it("allows non-recursive rm", () => {
+    assert.equal(getCommandBlockReason(["rm", "tmp.txt"]), null);
   });
 });
 
@@ -135,6 +177,24 @@ describe("getCommandBlockReason — path resolution", () => {
 
   it("blocks .exe suffix on Windows", () => {
     assert.ok(getCommandBlockReason(["cmd.exe", "/c", "del"]));
+  });
+
+  it("blocks path-qualified destructive rm", () => {
+    assert.ok(getCommandBlockReason(["/bin/rm", "-rf", "target"]));
+  });
+
+  it("blocks executable-suffix destructive rm", () => {
+    assert.ok(getCommandBlockReason(["rm.exe", "-rf", "target"]));
+    assert.ok(getCommandBlockReason(["rm.cmd", "-rf", "target"]));
+  });
+
+  it("blocks path-qualified permission mutation commands", () => {
+    assert.ok(getCommandBlockReason(["/usr/bin/chmod", "777", "file"]));
+  });
+
+  it("blocks executable-suffix permission mutation commands", () => {
+    assert.ok(getCommandBlockReason(["chown.exe", "user", "file"]));
+    assert.ok(getCommandBlockReason(["chgrp.bat", "group", "file"]));
   });
 });
 

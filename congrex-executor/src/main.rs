@@ -456,17 +456,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()?;
         fs::set_permissions(&temp, permissions)?;
 
-        #[cfg(not(windows))]
-        {
-            fs::rename(&temp, path)?;
-        }
-        #[cfg(windows)]
-        {
-            if fs::rename(&temp, path).is_err() {
-                let _ = fs::remove_file(path);
-                fs::rename(&temp, path)?;
-            }
-        }
+        replace_file_with_temp(&temp, path)?;
         Ok(())
     })();
 
@@ -474,6 +464,60 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_file_with_temp(temp: &Path, path: &Path) -> Result<()> {
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file_with_temp(temp: &Path, path: &Path) -> Result<()> {
+    let parent = path.parent().context("path has no parent directory")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("path has no valid file name")?;
+    let backup = parent.join(format!(
+        ".congrex-executor-{}-{}-{file_name}.bak",
+        std::process::id(),
+        now_millis()
+    ));
+
+    // Windows does not provide the same overwrite-by-rename behavior as Unix
+    // through std::fs::rename. Preserve the original first, then roll it back
+    // if installing the replacement fails. This is not fully atomic, but it
+    // avoids deleting the only good copy before the replacement is in place.
+    fs::rename(path, &backup).with_context(|| {
+        format!(
+            "failed to move original {} to backup {} before replacement",
+            path.display(),
+            backup.display()
+        )
+    })?;
+
+    match fs::rename(temp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(replace_err) => match fs::rename(&backup, path) {
+            Ok(()) => Err(anyhow!(
+                "failed to replace {}; original restored from {}; replacement error: {}",
+                path.display(),
+                backup.display(),
+                replace_err
+            )),
+            Err(restore_err) => Err(anyhow!(
+                "failed to replace {}; original preserved at {} but could not be restored: {}; replacement error: {}",
+                path.display(),
+                backup.display(),
+                restore_err,
+                replace_err
+            )),
+        },
+    }
 }
 
 #[cfg(windows)]
@@ -1287,6 +1331,23 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_replaces_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "congrex-executor-atomic-write-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("target.txt");
+        fs::write(&file, "old").unwrap();
+
+        atomic_write(&file, b"new").unwrap();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn program_name_strips_exe_suffix() {
         assert_eq!(program_name("cmd.exe"), "cmd");
         assert_eq!(program_name("git"), "git");
@@ -1298,6 +1359,29 @@ mod tests {
     #[test]
     fn program_name_windows_backslash_path() {
         assert_eq!(program_name("C:\\Windows\\System32\\cmd.exe"), "cmd");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_restores_original_if_replacement_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "congrex-executor-windows-rollback-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("target.txt");
+        let missing_temp = dir.join("missing.tmp");
+        fs::write(&file, "original").unwrap();
+
+        let err = replace_file_with_temp(&missing_temp, &file).unwrap_err();
+
+        assert!(
+            err.to_string().contains("original restored"),
+            "expected rollback error, got {err}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

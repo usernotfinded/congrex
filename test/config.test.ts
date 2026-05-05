@@ -61,7 +61,8 @@ async function listConfigTempFiles(): Promise<string[]> {
 
 test("save/load preserves apiKeyEnvVar and never writes the resolved secret value", { concurrency: false }, async () => {
   await withTempConfigDir(async () => {
-    const secretValue = "sk-live-secret-value";
+    // Intentionally fake and shaped to avoid matching real provider token formats.
+    const secretValue = "TEST_FAKE_API_KEY_VALUE_DO_NOT_USE";
     process.env.CONGREX_TEST_OPENAI_KEY = secretValue;
     try {
       await saveSenators([

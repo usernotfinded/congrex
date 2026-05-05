@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     name: Verify on ${{ matrix.os }}
@@ -15,15 +18,20 @@ jobs:
 
     steps:
       - name: Check out repository
+        # TODO: pin GitHub Actions to full commit SHAs after verifying exact upstream SHAs.
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
+        # TODO: pin GitHub Actions to full commit SHAs after verifying exact upstream SHAs.
         uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
 
       - name: Set up Rust
+        # TODO: pin GitHub Actions to full commit SHAs after verifying exact upstream SHAs.
         uses: dtolnay/rust-toolchain@stable
 
       - name: Check Rust executor compiles for native target

@@ -92,6 +92,14 @@ If Rust is not installed yet, install it first from [rustup.rs](https://rustup.r
 npm install -g congrex
 ```
 
+For docs-only or development installs where you do not plan to run Congrex yet, you can skip the executor build explicitly:
+
+```bash
+CONGREX_SKIP_EXECUTOR_BUILD=1 npm install
+```
+
+That leaves the package without a working executor. Execution rounds will not work until you build `congrex-executor` or set `CONGREX_EXECUTOR_BIN` to a valid executor binary.
+
 After a global install, start the CLI with:
 
 ```bash
@@ -184,6 +192,8 @@ Recommendation: prefer provider environment variables or `apiKeyEnvVar`. Use a l
 
 ### MCP environment isolation
 
+MCP server commands configured in `~/.config/congrex/config.json` are executed as local child processes during startup. The MCP tool approval gate controls which discovered tools are exposed to LLMs; it does not approve or sandbox the configured server process itself. Only configure MCP servers you trust to run on your machine.
+
 MCP servers run as child processes. They receive a sanitized environment containing only the system variables needed to function, such as PATH, HOME, locale, TLS certificates, language runtime paths, and proxy settings. API keys, database URLs, cloud credentials, and other secrets from the parent process are not forwarded by default.
 
 Operators can pass additional specific env vars per server via the `env` field in `config.json`. Those variables are explicitly chosen and trusted.
@@ -264,3 +274,14 @@ The MCP manager maintains a rolling audit log of the last 200 tool invocations, 
 ### Privacy
 
 Congrex is local-first. Senator definitions, sessions, presets, and configuration stay on your machine in `~/.config/congrex/`. The CLI talks directly to the providers and MCP servers you configure. There is no hosted Congrex backend.
+
+## Maintainability Roadmap
+
+The current implementation keeps the CLI in a small number of files. Future low-risk extraction boundaries are:
+
+- provider clients and response parsing from `src/index.ts`,
+- CLI command routing and interactive prompts from `src/index.ts`,
+- execution approval helpers from `src/index.ts`,
+- MCP approval/session glue from `src/index.ts`,
+- session persistence remains in `src/config.ts`,
+- Rust executor command policy, file replacement, and process containment can be split from `congrex-executor/src/main.rs` after behavior-preserving tests are in place.

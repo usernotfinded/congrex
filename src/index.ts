@@ -4001,6 +4001,9 @@ function applyMcpApproval(allTools: readonly import("./mcp.js").McpTool[]): void
 async function main(): Promise<void> {
   initializeInputHandling();
   initUpdateNotifier();
+  // Trust boundary: configured MCP server commands start as local child
+  // processes here. The later approval gate controls tool exposure to LLMs,
+  // not whether those configured local server processes are launched.
   await mcpManager.initialize();
 
   // [P1 FIX] Require human approval of MCP tools before any debate can use them.

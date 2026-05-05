@@ -810,6 +810,8 @@ export class McpManager {
   private async connectServer(name: string, config: McpServerConfig): Promise<void> {
     // [P1 FIX] Always use a sanitized environment. Never inherit the full
     // process.env — it contains API keys and secrets that MCP servers must not see.
+    // Trust boundary: config.command is executed as trusted local code. Tool
+    // approval filters later LLM tool use; it is not a process-start approval.
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args,

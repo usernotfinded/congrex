@@ -21,7 +21,7 @@ export const BLOCKED_PROGRAMS: ReadonlySet<string> = new Set([
   "nohup", "env", "xargs", "nice", "ionice", "timeout", "stdbuf", "setsid",
   "open", "xdg-open", "start",
   // Background / scheduling / multiplexing
-  "screen", "tmux", "at", "batch", "crontab",
+  "screen", "tmux", "at", "batch", "crontab", "nq",
   // Remote access / exfiltration
   "ssh", "scp", "sftp", "rsync", "telnet", "ftp", "nc", "ncat", "netcat", "socat",
   // Network data transfer
@@ -43,6 +43,8 @@ export const BLOCKED_PROGRAMS: ReadonlySet<string> = new Set([
   "gcc", "g++", "clang", "clang++", "cc", "c++",
 ]);
 
+export const PERMISSION_MUTATION_PROGRAMS: ReadonlySet<string> = new Set(["chmod", "chown", "chgrp"]);
+
 export const WARN_PROGRAMS: ReadonlySet<string> = new Set([
   // These are sometimes legitimate but deserve extra scrutiny
   "npm", "npx", "yarn", "pnpm", "bun",
@@ -63,11 +65,47 @@ export const BLOCKED_ARG_PATTERNS: readonly RegExp[] = [
 
 // ─── Main validation ───────────────────────────────────────────────
 
+function programName(raw: string | undefined): string {
+  const basename = (raw || "").split(/[\\/]/).pop()?.toLowerCase() || "";
+  return basename.replace(/\.(exe|cmd|bat|com)$/, "");
+}
+
+function rmHasForceAndRecursive(args: readonly string[]): boolean {
+  let hasForce = false;
+  let hasRecursive = false;
+
+  for (const arg of args) {
+    if (!arg.startsWith("-")) {
+      continue;
+    }
+
+    if (arg === "--force") {
+      hasForce = true;
+      continue;
+    }
+    if (arg === "--recursive" || arg === "--dir") {
+      hasRecursive = true;
+      continue;
+    }
+
+    if (!arg.startsWith("--")) {
+      hasForce ||= arg.includes("f");
+      hasRecursive ||= arg.includes("r") || arg.includes("R");
+    }
+  }
+
+  return hasForce && hasRecursive;
+}
+
 export function getCommandBlockReason(command: string[]): string | null {
-  const program = command[0].split("/").pop()?.toLowerCase().replace(/\.exe$/, "") || "";
+  const program = programName(command[0]);
 
   if (BLOCKED_PROGRAMS.has(program)) {
     return `Program "${program}" is blocked. It can be used for privilege escalation, remote access, or arbitrary code execution.`;
+  }
+
+  if (PERMISSION_MUTATION_PROGRAMS.has(program)) {
+    return `Program "${program}" is blocked because it changes file permissions or ownership.`;
   }
 
   // Block interpreters with inline eval flags
@@ -100,6 +138,11 @@ export function getCommandBlockReason(command: string[]): string | null {
     }
   }
 
+  // Match the Rust executor's destructive rm policy before prompting the user.
+  if (program === "rm" && rmHasForceAndRecursive(command.slice(1))) {
+    return `"rm" with both recursive and force flags is blocked.`;
+  }
+
   // Block destructive find arguments
   if (program === "find") {
     const dangerousActions = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir"]);
@@ -112,6 +155,6 @@ export function getCommandBlockReason(command: string[]): string | null {
 }
 
 export function isWarnProgram(command: string[]): boolean {
-  const program = command[0].split("/").pop()?.toLowerCase().replace(/\.exe$/, "") || "";
+  const program = programName(command[0]);
   return WARN_PROGRAMS.has(program);
 }
