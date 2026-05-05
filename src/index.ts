@@ -58,7 +58,7 @@ import {
   createSessionChamberSnapshot,
   deriveSessionRestoreState,
 } from "./sessionResume.js";
-import { initUpdateNotifier, runSelfUpdate } from "./utils/updateNotifier.js";
+import { initUpdateNotifier, runManualUpdate } from "./utils/updateNotifier.js";
 import { APP_VERSION } from "./version.js";
 import {
   chooseWinner,
@@ -3613,8 +3613,8 @@ async function promptForDebateTopic(session: { current: SessionData }): Promise<
     }
 
     if (userPrompt === "/update") {
-      await runUpdateCommand();
-      return userPrompt;
+      await runUpdateCommand({ exitWhenNoInstall: false });
+      continue;
     }
 
     if (userPrompt === "/clear") {
@@ -3759,11 +3759,15 @@ async function runSession(): Promise<void> {
   }
 }
 
-async function runUpdateCommand(): Promise<void> {
-  const status = runSelfUpdate();
+async function runUpdateCommand(options: { exitWhenNoInstall: boolean }): Promise<void> {
+  const result = await runManualUpdate();
+  if (!result.attemptedInstall && !options.exitWhenNoInstall) {
+    return;
+  }
+
   await congrexExecutor.dispose().catch(() => {});
   await mcpManager.shutdown().catch(() => {});
-  process.exit(status);
+  process.exit(result.status);
 }
 
 /**
@@ -4030,7 +4034,8 @@ async function main(): Promise<void> {
   }
 
   if (command === "update") {
-    await runUpdateCommand();
+    await runUpdateCommand({ exitWhenNoInstall: true });
+    return;
   }
 
   console.log(usage);

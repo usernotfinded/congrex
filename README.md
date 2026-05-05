@@ -136,7 +136,7 @@ congrex
 - `/resume` resume a previous session.
 - `/copy` copy the latest consensus output to the clipboard.
 - `/implement` force the execution round on the last winner answer. You can append extra instructions, for example `/implement add tests`.
-- `/update` update Congrex globally with `npm install -g congrex@latest`, then exit.
+- `/update` check for a new Congrex release and, after confirmation, update globally with npm.
 - `/clear` clear the terminal screen.
 - `/wipe` remove all senators. `/reset` is an alias.
 - `/exit` quit Congrex. `/quit` is an alias.
@@ -145,7 +145,19 @@ Congrex requires at least 2 active senators and 1 active Senate President before
 
 Congrex does not impose a hard upper limit on active senators. More than 4 active senators is allowed, but it is strongly discouraged unless you explicitly want slower, more expensive debates.
 
-On startup, Congrex also performs a silent npm version check using `update-notifier`. If a newer package version is known, it shows a small non-blocking upgrade hint. Set `NO_UPDATE_NOTIFIER=1` to disable that check.
+On startup, Congrex also performs a silent npm version check using `update-notifier`. If a newer package version is known, it shows a small non-blocking upgrade hint with `/update` as the install command. Set `NO_UPDATE_NOTIFIER=1` to disable that check.
+
+### Manual updates
+
+Congrex checks for new versions, but it never auto-installs updates. Congrex uses explicit manual updates because it can execute local code and includes a Rust executor; updating changes a sensitive local execution component, and npm installation may run install scripts or rebuild the executor. This also keeps enterprise, development, and CI environments from receiving unexpected package changes.
+
+Use `/update` to check and install a newer release. If an update is available, Congrex asks for confirmation:
+
+```text
+Install Congrex 1.0.7 now? [y/N]
+```
+
+Only `y` or `yes` starts `npm install -g congrex@latest`. Pressing enter or any other response cancels. Restart Congrex after a successful update so the new installed version is used.
 
 When you resume a session, Congrex restores the saved debate history, the last consensus output, and the last winning senator context. That means you can use `/implement` immediately after `/resume` without rerunning the debate first. If the current active chamber or Senate President no longer matches the saved session, Congrex warns you before the next debate continues with the current chamber.
 
