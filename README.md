@@ -1,5 +1,8 @@
 # Congrex AI Senate (v1.0.6)
 
+![Congrex Banner](./assets/congrexBanner.png)
+
+
 Congrex turns one prompt into a structured debate between multiple AI models, then promotes the strongest answer into an optional supervised execution round when implementation is actually needed.
 
 It is built for code and technical decision-making where a single model answer is often not enough. Congrex lets a chamber of models answer, critique, and vote, uses a mandatory Senate President to break ties, and keeps any file edits or terminal commands behind explicit human approval.
