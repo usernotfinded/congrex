@@ -1411,7 +1411,9 @@ mod tests {
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // capture_child drains both streams before returning. The test
+            // asserts stdout only, but stderr still needs to be piped.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .env("TERM", "dumb")
             .env("NO_COLOR", "1");
@@ -1419,11 +1421,12 @@ mod tests {
         let WindowsContainedChild {
             mut child,
             job_guard,
-        } = spawn_windows_contained_child(&mut command, &["powershell.exe".to_string()]).unwrap();
+        } = spawn_windows_contained_child(&mut command, &["powershell.exe".to_string()])
+            .expect("failed to spawn Windows-contained PowerShell test harness");
 
         let output = capture_child(&mut child, Duration::from_millis(1000), job_guard)
             .await
-            .unwrap();
+            .expect("failed to capture timed-out Windows-contained child");
         assert!(output.timed_out);
         assert_eq!(output.exit_code, EXEC_TIMEOUT_EXIT_CODE);
 
